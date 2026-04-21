@@ -1,0 +1,45 @@
+# ── Executables (download separately) ───────────────────────────────────────
+HandBrakeCLI.exe
+ffmpeg.exe
+ffprobe.exe
+AV1_Transcoder.exe
+
+# ── Build artifacts ──────────────────────────────────────────────────────────
+build/
+dist/
+*.spec.bak
+
+# ── Python ───────────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+venv/
+.venv/
+env/
+
+# ── Personal configuration & databases ───────────────────────────────────────
+# These contain your local paths and media metadata — keep them private
+config.json
+biblioteca_*.json
+
+# ── Logs & reports ───────────────────────────────────────────────────────────
+*.log
+*.txt
+reporte_*.txt
+*.xlsx
+
+# ── Editor & tool config ─────────────────────────────────────────────────────
+.claude/
+
+# ── OS & IDE ─────────────────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+desktop.ini
+.vscode/
+.idea/
+*.swp
+*~
+
+# ── Temporary transcoding files ───────────────────────────────────────────────
+temp/

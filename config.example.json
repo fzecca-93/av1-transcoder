@@ -1,0 +1,20 @@
+{
+  "libraries": [
+    {
+      "name": "Movies",
+      "input_dir": "Z:/Movies",
+      "output_dir": "C:/Users/YourUser/Videos/Transcoded"
+    },
+    {
+      "name": "Series",
+      "input_dir": "Z:/Series",
+      "output_dir": "C:/Users/YourUser/Videos/Transcoded"
+    },
+    {
+      "name": "NAS via UNC",
+      "input_dir": "//your-nas/share/Movies",
+      "output_dir": "C:/Users/YourUser/Videos/Transcoded"
+    }
+  ],
+  "active_library": 0
+}
