@@ -6,6 +6,7 @@ A Windows desktop application to scan, catalog, and mass-transcode your media li
 ![Platform](https://img.shields.io/badge/Platform-Windows-0078D6?logo=windows)
 ![GPU](https://img.shields.io/badge/GPU-NVIDIA%20NVENC-76B900?logo=nvidia)
 ![License](https://img.shields.io/badge/License-MIT-green)
+![Vibe Coded](https://img.shields.io/badge/Built%20with-Vibe%20Coding-a855f7?logo=anthropic&logoColor=white)
 
 ---
 
@@ -239,6 +240,25 @@ Pull requests are welcome. For major changes, please open an issue first.
 ## License
 
 [MIT](LICENSE)
+
+---
+
+## Built with Vibe Coding
+
+This project was built entirely through **vibe coding** — a collaborative process where the developer drives the product vision, requirements, and decisions, while an AI assistant (Claude by Anthropic) handles the implementation.
+
+Every feature in this app was born from a real need:
+
+> *"the black terminal window that flashes on every operation"* → `CREATE_NO_WINDOW`
+> *"if a pre-load finishes early, download the next one"* → continuous pre-fetch pipeline
+> *"I need to see the queue before starting"* → queue manager window
+> *"anime doesn't compress well"* → anime encoding mode
+> *"remove fan noise automatically"* → parallel FFmpeg `afftdn` pipeline
+> *"can audio be processed at the same time as HandBrake?"* → truly parallel audio thread
+
+No line of code was written by hand. The entire codebase — architecture decisions, threading model, UI layout, pipeline design — emerged from an iterative conversation between a clear idea of what was needed and an AI that knew how to build it.
+
+If you're curious about vibe coding or want to build something similar, the full conversation history is preserved in `LLM-AI.md`.
 
 ---
 
