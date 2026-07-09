@@ -76,6 +76,7 @@ class TranscoderApp(ctk.CTk):
         self.vistos_data = self.load_vistos()
         self.all_found_files = self._db_to_file_list()
         self.current_filter = "TODOS"
+        self.min_size_mb = 0.0
         self.view_mode = "flat"
         self._render_gen = 0
 
@@ -515,6 +516,13 @@ class TranscoderApp(ctk.CTk):
         self.btn_f_unknown = ctk.CTkButton(filter_frame, text="SIN INFO", width=80, fg_color="transparent", border_width=1, command=lambda: self.set_filter("DESCONOCIDO"))
         self.btn_f_unknown.pack(side="left", padx=5)
 
+        ctk.CTkLabel(filter_frame, text="  |  Ocultar <", font=("Segoe UI", 10)).pack(side="left", padx=(10, 2))
+        self.size_filter_entry = ctk.CTkEntry(filter_frame, width=58, placeholder_text="0")
+        self.size_filter_entry.pack(side="left", padx=(0, 2))
+        ctk.CTkLabel(filter_frame, text="MB", font=("Segoe UI", 10)).pack(side="left")
+        self.size_filter_entry.bind("<Return>", lambda e: self._apply_size_filter())
+        self.size_filter_entry.bind("<FocusOut>", lambda e: self._apply_size_filter())
+
         self.btn_view_toggle = ctk.CTkButton(filter_frame, text="Vista: Lista", width=110,
                                               fg_color="#2c3e50", hover_color="#1a252f",
                                               command=self.toggle_view_mode)
@@ -658,6 +666,13 @@ class TranscoderApp(ctk.CTk):
             self.btn_f_unknown.configure(fg_color="#95a5a6", border_width=0)
         self.render_library()
 
+    def _apply_size_filter(self):
+        try:
+            self.min_size_mb = float(self.size_filter_entry.get().strip() or 0)
+        except ValueError:
+            self.min_size_mb = 0.0
+        self.render_library()
+
     def render_library(self):
         self._render_gen += 1
         children = self.tree.get_children()
@@ -732,6 +747,8 @@ class TranscoderApp(ctk.CTk):
             if self.current_filter != "TODOS" and status_code != self.current_filter:
                 continue
             db_entry = self.vistos_data.get(item['path'], {})
+            if self.min_size_mb > 0 and (db_entry.get('size', 0) or 0) < self.min_size_mb * 1024 * 1024:
+                continue
             sz = _format_size(db_entry.get('size', 0))
             sub_text = self._sub_display(item['path'])
             rows.append((item['path'], item['name'], sz, status_text, source_text, sub_text, tags))
@@ -861,6 +878,10 @@ class TranscoderApp(ctk.CTk):
             rel_str = file_folder.get(item['path'])
             if rel_str is None:
                 continue
+            if self.min_size_mb > 0:
+                db_sz = self.vistos_data.get(item['path'], {}).get('size', 0) or 0
+                if db_sz < self.min_size_mb * 1024 * 1024:
+                    continue
             parent_iid = f"f:{rel_str}" if rel_str != "." and rel_str in inserted else ""
             status_text, source_text, tags, _ = self._file_display_info(item)
             db_entry = self.vistos_data.get(item['path'], {})
@@ -1162,6 +1183,12 @@ class TranscoderApp(ctk.CTk):
         re_av1 = re.compile(r"(?i)AV1")
         re_others = re.compile(r"(?i)x264|h264|h\.264|x265|h265|h\.265|hevc|avc")
 
+        # Eliminar de la DB los archivos que ya no existen en disco
+        deleted_paths = [p for p in list(self.vistos_data.keys()) if not Path(p).exists()]
+        for p in deleted_paths:
+            del self.vistos_data[p]
+        self.all_found_files = [f for f in self.all_found_files if f['path'] not in deleted_paths]
+
         # Build a set of known paths for O(1) lookup
         known_paths = set(self.vistos_data.keys())
 
@@ -1181,7 +1208,8 @@ class TranscoderApp(ctk.CTk):
                     total_walked += 1
 
                     if total_walked % 50 == 0:
-                        self.update_queue.put(("scan_progress", f"Revisados: {total_walked} | Nuevos: {new_count}..."))
+                        del_msg = f" | Eliminados: {len(deleted_paths)}" if deleted_paths else ""
+                        self.update_queue.put(("scan_progress", f"Revisados: {total_walked} | Nuevos: {new_count}{del_msg}..."))
 
                     if f_str in known_paths:
                         # Already in DB — add to file list if missing (e.g. first run after restart)
@@ -1208,7 +1236,8 @@ class TranscoderApp(ctk.CTk):
             self.update_queue.put(("log", f"Error en escaneo: {e}\n"))
 
         self.save_vistos()
-        self.update_queue.put(("scan_progress", f"Scan completado: {new_count} nuevos encontrados ({total_walked} revisados)."))
+        deleted_msg = f" | {len(deleted_paths)} eliminados" if deleted_paths else ""
+        self.update_queue.put(("scan_progress", f"Scan completado: {new_count} nuevos encontrados ({total_walked} revisados){deleted_msg}."))
         self.update_queue.put(("scan_done", None))
 
     def analyze_individual(self, path):

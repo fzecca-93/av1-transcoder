@@ -3,6 +3,7 @@ HandBrakeCLI.exe
 ffmpeg.exe
 ffprobe.exe
 AV1_Transcoder.exe
+SubtitleConverter.exe
 
 # ── Build artifacts ──────────────────────────────────────────────────────────
 build/
@@ -22,6 +23,7 @@ env/
 # These contain your local paths and media metadata — keep them private
 config.json
 biblioteca_*.json
+subtitle_converter_config.json
 
 # ── Logs & reports ───────────────────────────────────────────────────────────
 *.log
