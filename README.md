@@ -15,8 +15,17 @@ A Windows desktop application to scan, catalog, and mass-transcode your media li
 ### Video Transcoding
 - **NVIDIA NVENC AV1 10-bit** encoding via HandBrakeCLI (GPU-accelerated)
 - Two encoding presets:
-  - **Movie / Series** — CQ 30, no filters
-  - **Anime / Animation** — CQ 32 + NLMeans light denoise tuned for animation
+  - **Movie / Series** — no filters
+  - **Anime / Animation** — NLMeans light denoise tuned for animation
+- **Quality (CQ)** selector: `Auto` (30 for movies, 32 for anime) or a fixed value
+  from 22 to 38 — lower CQ means better quality and a bigger file
+- Optional downscaling: **Original**, **1080p** (max 1920x1080) or **720p** (max 1280x720)
+  - Never upscales — a 720p source stays 720p in any mode
+  - Downscaled output gets the new resolution in its filename, so it never
+    overwrites a previous full-resolution encode
+  - Files that are **already AV1 are re-encoded when a downscale applies**
+    (an AV1 1080p goes to AV1 720p); they are still skipped when the source is
+    already at or below the target height
 - Automatic size filter: skips files where the output would not save at least 10% space
 
 ### Audio Processing
@@ -156,6 +165,12 @@ Click **📋 View Queue (N)** to open the queue manager where you can reorder or
 In the **Transcoder** tab:
 - **Mode**: Movie/Series or Anime/Animation
 - **Audio**: Enable noise reduction and choose intensity
+- **Resolution**: Original, 1080p or 720p (720p typically saves another 40-55%)
+- **Quality (CQ)**: Auto, or a fixed value from 22 (best quality) to 38 (smallest)
+
+To convert files that are already AV1 down to 720p, filter the library by
+**YA AV1**, select them, add them to the queue and confirm the "already
+optimized" warning.
 
 ### 5. Start
 

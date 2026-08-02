@@ -32,6 +32,21 @@ NETWORK_RETRY_DELAY = 10
 MAX_RETRIES = 3
 CONFIG_FILE = "config.json"
 
+# Resoluciones de salida: etiqueta -> (ancho máx, alto máx). None = mantener origen.
+# HandBrake nunca escala hacia arriba con --maxWidth/--maxHeight, así que un
+# archivo 720p procesado en modo "1080p" se mantiene en 720p.
+RESOLUTIONS = {
+    "Original": None,
+    "1080p": (1920, 1080),
+    "720p": (1280, 720),
+}
+CQ_CHOICES = ["Auto"] + [str(q) for q in range(22, 39, 2)]
+CQ_AUTO = {"Anime / Dibujos": 32, "Pelicula / Serie": 30}
+# Etiqueta de resolución dentro del nombre del archivo (para renombrar la salida).
+RES_NAME_TAG = re.compile(r"(?i)\b(2160p|1440p|1080p|720p|576p|480p|4k|uhd)\b")
+TAG_HEIGHT = {"2160p": 2160, "4k": 2160, "uhd": 2160, "1440p": 1440,
+              "1080p": 1080, "720p": 720, "576p": 576, "480p": 480}
+
 
 def get_db_filename(library_name):
     safe = re.sub(r'[^\w\-]', '_', library_name)
@@ -59,6 +74,8 @@ class TranscoderApp(ctk.CTk):
         self.encode_mode   = tk.StringVar(value="normal")   # "normal" | "anime"
         self.audio_denoise = tk.BooleanVar(value=False)
         self.denoise_level = tk.StringVar(value="Normal")   # Suave | Normal | Fuerte
+        self.target_res    = tk.StringVar(value="Original") # Original | 1080p | 720p
+        self.target_cq     = tk.StringVar(value="Auto")     # Auto | "22".."38"
 
         # Multi-library state
         self.libraries = []   # [{name, input_dir, output_dir}, ...]
@@ -398,7 +415,7 @@ class TranscoderApp(ctk.CTk):
         self.mode_selector.grid(row=0, column=1, padx=10, pady=8, sticky="w")
         self.mode_info_label = ctk.CTkLabel(
             mode_frame,
-            text="CQ 30 · Sin filtros",
+            text="Sin filtros",
             font=("Segoe UI", 11),
             text_color="#888888",
         )
@@ -424,6 +441,44 @@ class TranscoderApp(ctk.CTk):
         )
         self.denoise_menu.grid(row=1, column=2, padx=(0, 15), pady=(0, 8), sticky="e")
 
+        # ── Fila 2: resolución de salida ────────────────────────────────────
+        ctk.CTkLabel(mode_frame, text="Resolución:", font=("Segoe UI", 12, "bold")).grid(
+            row=2, column=0, padx=(15, 10), pady=(0, 8), sticky="w")
+        self.res_selector = ctk.CTkSegmentedButton(
+            mode_frame,
+            values=list(RESOLUTIONS.keys()),
+            variable=self.target_res,
+            command=self._on_res_changed,
+        )
+        self.res_selector.grid(row=2, column=1, padx=10, pady=(0, 8), sticky="w")
+        self.res_info_label = ctk.CTkLabel(
+            mode_frame,
+            text="Mantiene la resolución del origen",
+            font=("Segoe UI", 11),
+            text_color="#888888",
+        )
+        self.res_info_label.grid(row=2, column=2, padx=(0, 15), pady=(0, 8), sticky="e")
+
+        # ── Fila 3: calidad (CQ) ────────────────────────────────────────────
+        ctk.CTkLabel(mode_frame, text="Calidad (CQ):", font=("Segoe UI", 12, "bold")).grid(
+            row=3, column=0, padx=(15, 10), pady=(0, 10), sticky="w")
+        self.cq_menu = ctk.CTkOptionMenu(
+            mode_frame,
+            values=CQ_CHOICES,
+            variable=self.target_cq,
+            command=self._on_cq_changed,
+            width=100,
+        )
+        self.cq_menu.grid(row=3, column=1, padx=10, pady=(0, 10), sticky="w")
+        self.cq_info_label = ctk.CTkLabel(
+            mode_frame,
+            text="Menor CQ = más calidad y más peso",
+            font=("Segoe UI", 11),
+            text_color="#888888",
+        )
+        self.cq_info_label.grid(row=3, column=2, padx=(0, 15), pady=(0, 10), sticky="e")
+        self._on_cq_changed(self.target_cq.get())
+
         self.log_text = ctk.CTkTextbox(self.tab_transcode, font=("Consolas", 11), fg_color="#121212")
         self.log_text.grid(row=4, column=0, padx=10, pady=5, sticky="nsew")
         self.start_button = ctk.CTkButton(self.tab_transcode, text="INICIAR TRANSCODIFICACIÓN", height=45, command=self.toggle_processing)
@@ -434,16 +489,48 @@ class TranscoderApp(ctk.CTk):
         state = "normal" if self.audio_denoise.get() else "disabled"
         self.denoise_menu.configure(state=state)
 
+    def _effective_cq(self) -> str:
+        """CQ que se le pasa a HandBrake: el elegido a mano, o el del modo si es Auto."""
+        sel = self.target_cq.get()
+        if sel != "Auto":
+            return sel
+        return str(CQ_AUTO.get(self.encode_mode.get(), 30))
+
     def _on_mode_changed(self, value):
         """Actualiza la etiqueta de info al cambiar el modo de codificación."""
         if value == "Anime / Dibujos":
             self.mode_info_label.configure(
-                text="CQ 32 · Denoise suave (NLMeans light)", text_color="#e67e22"
+                text="Denoise suave (NLMeans light)", text_color="#e67e22"
             )
         else:
             self.mode_info_label.configure(
-                text="CQ 30 · Sin filtros", text_color="#888888"
+                text="Sin filtros", text_color="#888888"
             )
+        self._on_cq_changed(self.target_cq.get())
+
+    def _on_res_changed(self, value):
+        """Actualiza la etiqueta de info al cambiar la resolución de salida."""
+        if value == "720p":
+            self.res_info_label.configure(
+                text="Máx 1280x720 · ~40-55% menos peso", text_color="#e67e22"
+            )
+        elif value == "1080p":
+            self.res_info_label.configure(
+                text="Máx 1920x1080 · solo baja el 4K", text_color="#3498db"
+            )
+        else:
+            self.res_info_label.configure(
+                text="Mantiene la resolución del origen", text_color="#888888"
+            )
+
+    def _on_cq_changed(self, value):
+        """Muestra el CQ que se va a usar realmente."""
+        cq = self._effective_cq()
+        if value == "Auto":
+            texto, color = f"Auto → CQ {cq} (según el modo)", "#888888"
+        else:
+            texto, color = f"CQ {cq} fijo · menor = más calidad y peso", "#3498db"
+        self.cq_info_label.configure(text=texto, text_color=color)
 
     def setup_library_tab(self):
         self.tab_library.grid_columnconfigure(0, weight=1)
@@ -1045,22 +1132,89 @@ class TranscoderApp(ctk.CTk):
         except Exception:
             pass
 
+    def _build_output_name(self, src: Path) -> str:
+        """Nombre del archivo de salida: la etiqueta de codec pasa a AV1 y, si se
+        pidió downscale, la etiqueta de resolución pasa a la elegida (o se añade
+        al final si el nombre no traía ninguna)."""
+        codec_tag = r"(?i)x264|h264|h\.264|x265|h265|h\.265|hevc|avc"
+        ns = re.sub(codec_tag, "AV1", src.stem)
+        if ns == src.stem and not re.search(r"(?i)\bAV1\b", ns):
+            # Sin etiqueta de codec reconocible: la añadimos (salvo que ya diga AV1,
+            # como pasa al rebajar de resolución un archivo ya convertido).
+            ns = src.stem + ".AV1"
+        res = self.target_res.get()
+        dims = RESOLUTIONS.get(res)
+        if dims:
+            tags = RES_NAME_TAG.findall(ns)
+            if not tags:
+                # El nombre no dice la resolución: marcamos la salida para no
+                # pisar una copia previa hecha en "Original".
+                ns += f".{res}"
+            elif dims[1] < max(TAG_HEIGHT[t.lower()] for t in tags):
+                # Solo renombramos si hubo downscale real; HandBrake nunca
+                # amplía, así que un 720p en modo 1080p conserva su nombre.
+                ns = RES_NAME_TAG.sub(res, ns)
+                # "4K.UHD" produce la etiqueta repetida: la colapsamos.
+                ns = re.sub(rf"(?:{res}[.\s_-]+)+{res}", res, ns)
+        return ns + ".mkv"
+
+    def _skip_because_already_av1(self, src: Path) -> bool:
+        """Un AV1 se saltea salvo que se haya pedido bajarlo de resolución y el
+        origen esté por encima del objetivo (ej. AV1 1080p → 720p)."""
+        if not self.check_is_av1(src):
+            return False
+        dims = RESOLUTIONS.get(self.target_res.get())
+        if not dims:
+            return True
+        h = self.probe_height(src)
+        if h is None:
+            # Sin dato de altura no arriesgamos una recodificación al pedo.
+            self.update_queue.put(("log",
+                f"  [Video] No se pudo leer la resolución de {src.name}; se saltea por ser AV1.\n"))
+            return True
+        if h > dims[1]:
+            self.update_queue.put(("log",
+                f"  [Video] {src.name} ya es AV1 pero mide {h}p → se rebaja a {self.target_res.get()}.\n"))
+            return False
+        return True
+
+    def _resolution_args(self) -> list:
+        """Argumentos de escalado para HandBrake según la resolución elegida."""
+        dims = RESOLUTIONS.get(self.target_res.get())
+        if not dims:
+            return []
+        w, h = dims
+        return ["--maxWidth", str(w), "--maxHeight", str(h)]
+
+    def _input_equals_output(self) -> bool:
+        """¿Origen y destino son la misma carpeta? El resultado se cachea porque
+        resolve() consulta el disco: sobre unidades de red, hacerlo una vez por
+        archivo dejaba la ventana sin abrir durante minutos al arrancar."""
+        key = (self.input_dir.get(), self.output_dir.get())
+        cached = getattr(self, "_io_same_cache", None)
+        if cached is not None and cached[0] == key:
+            return cached[1]
+        try:
+            same = str(Path(key[0]).resolve()) == str(Path(key[1]).resolve())
+        except OSError:
+            same = (os.path.normcase(os.path.abspath(key[0]))
+                    == os.path.normcase(os.path.abspath(key[1])))
+        self._io_same_cache = (key, same)
+        return same
+
     def get_expected_local_output(self, src_str):
         if not self.input_dir.get() or not self.output_dir.get():
             return None
         in_r = Path(self.input_dir.get())
         out_r = Path(self.output_dir.get())
-        if str(in_r.resolve()) == str(out_r.resolve()):
+        if self._input_equals_output():
             return None
         src = Path(src_str)
         try:
             rel = src.parent.relative_to(in_r)
         except ValueError:
             return None
-        codec_tag = r"(?i)x264|h264|h\.264|x265|h265|h\.265|hevc|avc"
-        ns = re.sub(codec_tag, "AV1", src.stem)
-        of = (ns + ".mkv") if ns != src.stem else (src.stem + ".AV1.mkv")
-        ff = out_r / rel / of
+        ff = out_r / rel / self._build_output_name(src)
         return ff
 
     def move_to_nas_selected(self):
@@ -1440,14 +1594,12 @@ class TranscoderApp(ctk.CTk):
     def _prefetch_verify_and_copy(self, src: Path, in_r: Path, out_r: Path, tmp: Path, result: dict):
         """Hilo de fondo: verifica codec y copia NAS→local el siguiente archivo de la cola."""
         try:
-            if self.check_is_av1(src):
+            if self._skip_because_already_av1(src):
                 self._update_db_entry(src, is_av1=True, identified_by="Verificación directa")
                 result['skip'] = True
                 return
 
-            codec_tag = r"(?i)x264|h264|h\.264|x265|h265|h\.265|hevc|avc"
-            ns = re.sub(codec_tag, "AV1", src.stem)
-            of = (ns + ".mkv") if ns != src.stem else (src.stem + ".AV1.mkv")
+            of = self._build_output_name(src)
             ff = out_r / src.parent.relative_to(in_r) / of
 
             if ff.exists():
@@ -1489,13 +1641,11 @@ class TranscoderApp(ctk.CTk):
                             on_transcode_start=None, prefetch_data=None):
         self.update_queue.put(("status", {"file": src.name, "action": "Verificando codec..."}))
 
-        if self.check_is_av1(src):
+        if self._skip_because_already_av1(src):
             self._update_db_entry(src, is_av1=True, identified_by="Verificación directa")
             return
 
-        codec_tag = r"(?i)x264|h264|h\.264|x265|h265|h\.265|hevc|avc"
-        ns = re.sub(codec_tag, "AV1", src.stem)
-        of = (ns + ".mkv") if ns != src.stem else (src.stem + ".AV1.mkv")
+        of = self._build_output_name(src)
         ff = out_r / src.parent.relative_to(in_r) / of
         if ff.exists():
             self._update_db_entry(src, is_av1=True, identified_by="Salida ya existe")
@@ -1520,14 +1670,14 @@ class TranscoderApp(ctk.CTk):
             on_transcode_start()   # arranca prefetch del siguiente archivo
 
         # Parámetros según modo de codificación seleccionado en la UI
+        quality = self._effective_cq()
         if self.encode_mode.get() == "Anime / Dibujos":
-            quality   = "32"
             mode_args = ["--nlmeans=light", "--nlmeans-tune=animation"]
             mode_tag  = "[ANIME]"
         else:
-            quality   = "30"
             mode_args = []
             mode_tag  = "[NORMAL]"
+        mode_tag += f" [CQ {quality}]"
 
         # ── Fase 2b: lanzar denoise de audio EN PARALELO con HandBrake ────────
         # FFmpeg lee li (mismo archivo local) y procesa solo el audio mientras
@@ -1577,11 +1727,17 @@ class TranscoderApp(ctk.CTk):
         audio_args = ["--aencoder", "copy", "--audio-fallback", "aac"] \
                      if self.audio_denoise.get() else []
 
+        res_args = self._resolution_args()
+        if res_args:
+            mode_tag += f" [{self.target_res.get()}]"
+            self.update_queue.put(("log",
+                f"  [Video] Escalado a máx {res_args[1]}x{res_args[3]} (sin upscale)\n"))
+
         self.update_queue.put(("status", {"file": src.name, "action": f"Transcodificando con GPU... {mode_tag}"}))
         self.update_queue.put(("progress", 0))
         cmd = [HANDBRAKE_CLI_PATH, "-i", str(li), "-o", str(lo),
                "-e", "nvenc_av1_10bit", "-q", quality, "--encoder-preset", "slow",
-               "--all-audio", "--all-subtitles"] + mode_args + audio_args
+               "--all-audio", "--all-subtitles"] + res_args + mode_args + audio_args
         proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                                 text=True, encoding='utf-8', errors='replace',
                                 creationflags=subprocess.CREATE_NO_WINDOW)
@@ -2166,6 +2322,32 @@ class TranscoderApp(ctk.CTk):
             return codec == "av1" if codec else None
         except Exception:
             return None
+
+    def probe_height(self, p):
+        """Alto en píxeles del video, o None si no se pudo determinar."""
+        ffprobe = self._find_ffprobe()
+        if ffprobe:
+            try:
+                result = subprocess.run(
+                    [ffprobe, "-v", "quiet", "-select_streams", "v:0",
+                     "-show_entries", "stream=height", "-of", "csv=p=0", str(p)],
+                    capture_output=True, text=True, timeout=15,
+                    encoding="utf-8", errors="replace",
+                    creationflags=subprocess.CREATE_NO_WINDOW
+                )
+                h = result.stdout.strip()
+                if h.isdigit():
+                    return int(h)
+            except Exception:
+                pass
+        try:
+            m = MediaInfo.parse(p)
+            for t in m.tracks:
+                if t.track_type == 'Video' and t.height:
+                    return int(t.height)
+        except Exception:
+            pass
+        return None
 
     def check_is_av1(self, p):
         ffprobe = self._find_ffprobe()

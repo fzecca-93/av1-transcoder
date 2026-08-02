@@ -1,4 +1,5 @@
 @echo off
+cd /d "%~dp0"
 title Sistema de Transcodificacion AV1 para tu NAS
 echo ==============================================
 echo MOTOR DE AV1 - LANZADOR AUTOMATIZADO
