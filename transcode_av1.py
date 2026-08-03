@@ -40,6 +40,19 @@ RESOLUTIONS = {
     "1080p": (1920, 1080),
     "720p": (1280, 720),
 }
+# Cada filtro de la biblioteca acepta un conjunto de estados (None = todos).
+# POR_HACER es el útil a diario: esconde lo terminado y lo descartado.
+FILTER_SETS = {
+    "TODOS":       None,
+    "POR_HACER":   {"NUEVO", "PENDIENTE", "AV1_REDUCIBLE", "DESCONOCIDO"},
+    "NUEVO":       {"NUEVO"},
+    "PENDIENTE":   {"PENDIENTE"},
+    "AV1":         {"AV1_REDUCIBLE", "AV1_LISTO"},
+    "OMITIDO":     {"OMITIDO"},
+    "LISTO_LOCAL": {"LISTO_LOCAL"},
+    "DESCONOCIDO": {"DESCONOCIDO"},
+}
+
 CQ_CHOICES = ["Auto"] + [str(q) for q in range(22, 39, 2)]
 CQ_AUTO = {"Anime / Dibujos": 32, "Pelicula / Serie": 30}
 # Etiqueta de resolución dentro del nombre del archivo (para renombrar la salida).
@@ -555,6 +568,7 @@ class TranscoderApp(ctk.CTk):
                 text="Mantiene la resolución del origen", text_color="#888888"
             )
         # La biblioteca marca lo que supera el objetivo: hay que redibujarla.
+        self._update_target_hint()
         if hasattr(self, "tree"):
             self.render_library()
 
@@ -636,6 +650,8 @@ class TranscoderApp(ctk.CTk):
         ctk.CTkLabel(filter_frame, text="Filtrar por:").pack(side="left", padx=10)
         self.btn_f_all = ctk.CTkButton(filter_frame, text="TODOS", width=80, fg_color="#34495e", command=lambda: self.set_filter("TODOS"))
         self.btn_f_all.pack(side="left", padx=5)
+        self.btn_f_todo = ctk.CTkButton(filter_frame, text="POR HACER", width=100, fg_color="transparent", border_width=1, command=lambda: self.set_filter("POR_HACER"))
+        self.btn_f_todo.pack(side="left", padx=5)
         self.btn_f_new = ctk.CTkButton(filter_frame, text="NUEVOS", width=80, fg_color="transparent", border_width=1, command=lambda: self.set_filter("NUEVO"))
         self.btn_f_new.pack(side="left", padx=5)
         self.btn_f_pending = ctk.CTkButton(filter_frame, text="PENDIENTES", width=100, fg_color="transparent", border_width=1, command=lambda: self.set_filter("PENDIENTE"))
@@ -662,6 +678,11 @@ class TranscoderApp(ctk.CTk):
             filter_frame, text="Solo mayores al objetivo", variable=self.only_above_target,
             command=self.render_library, font=("Segoe UI", 10), checkbox_width=18, checkbox_height=18)
         self.above_check.pack(side="left", padx=(12, 0))
+        # El objetivo se elige en la otra pestaña; sin verlo acá, que todo diga
+        # "LISTO" con el objetivo en Original parece un error.
+        self.target_hint = ctk.CTkLabel(filter_frame, text="", font=("Segoe UI", 10))
+        self.target_hint.pack(side="left", padx=(6, 0))
+        self._update_target_hint()
 
         self.btn_view_toggle = ctk.CTkButton(filter_frame, text="Vista: Lista", width=110,
                                               fg_color="#2c3e50", hover_color="#1a252f",
@@ -786,12 +807,18 @@ class TranscoderApp(ctk.CTk):
             self.update_queue.put(("log", f"Error Excel: {e}\n"))
             self.update_queue.put(("import_done", None))
 
+    def _passes_filter(self, status_code) -> bool:
+        permitidos = FILTER_SETS.get(self.current_filter)
+        return permitidos is None or status_code in permitidos
+
     def set_filter(self, filter_name):
         self.current_filter = filter_name
-        for btn in [self.btn_f_all, self.btn_f_new, self.btn_f_pending, self.btn_f_av1, self.btn_f_omitidos, self.btn_f_local, self.btn_f_unknown]:
+        for btn in [self.btn_f_all, self.btn_f_todo, self.btn_f_new, self.btn_f_pending, self.btn_f_av1, self.btn_f_omitidos, self.btn_f_local, self.btn_f_unknown]:
             btn.configure(fg_color="transparent", border_width=1)
         if filter_name == "TODOS":
             self.btn_f_all.configure(fg_color="#34495e", border_width=0)
+        elif filter_name == "POR_HACER":
+            self.btn_f_todo.configure(fg_color="#c0392b", border_width=0)
         elif filter_name == "NUEVO":
             self.btn_f_new.configure(fg_color="#e67e22", border_width=0)
         elif filter_name == "PENDIENTE":
@@ -805,6 +832,17 @@ class TranscoderApp(ctk.CTk):
         elif filter_name == "DESCONOCIDO":
             self.btn_f_unknown.configure(fg_color="#95a5a6", border_width=0)
         self.render_library()
+
+    def _update_target_hint(self):
+        """Deja a la vista qué objetivo se está usando para marcar reducibles."""
+        if not hasattr(self, "target_hint"):
+            return
+        res = self.target_res.get()
+        if RESOLUTIONS.get(res):
+            self.target_hint.configure(text=f"(objetivo: {res})", text_color="#3498db")
+        else:
+            self.target_hint.configure(
+                text="(objetivo: Original — nada se reduce)", text_color="#e67e22")
 
     def _height_of(self, path_str) -> int:
         """Alto guardado en la DB, o 0 si el archivo todavía no fue analizado."""
@@ -842,6 +880,7 @@ class TranscoderApp(ctk.CTk):
 
     def _tag_configure_all(self):
         self.tree.tag_configure("av1",        foreground="#2ecc71")
+        self.tree.tag_configure("av1_final",  foreground="#1abc9c")
         self.tree.tag_configure("no_en_origen", foreground="#f1c40f")
         self.tree.tag_configure("nuevo",      foreground="#e67e22")
         self.tree.tag_configure("pendiente",  foreground="#3498db")
@@ -862,9 +901,13 @@ class TranscoderApp(ctk.CTk):
                 if ff and ff.exists():
                     status_text = "NO EN ORIGEN (Listo local)"
                     tags = ("no_en_origen",)
-                else:
-                    status_text = "OPTIMIZADO (AV1)"
+                elif self._exceeds_target(item['path']):
+                    status_text = "OPTIMIZADO (AV1) — se puede reducir"
                     tags = ("av1",)
+                else:
+                    # AV1 y dentro del objetivo: no queda nada por hacerle.
+                    status_text = "LISTO (AV1)"
+                    tags = ("av1_final",)
             elif is_av1 == "NO_TRANSCODIFICAR":
                 status_text = "NO TRANSCODIFICAR (Poco ahorro)"
                 tags = ("omitido",)
@@ -885,7 +928,8 @@ class TranscoderApp(ctk.CTk):
                 status_text += f"  ·  {alto}p"
                 if self._exceeds_target(item['path']):
                     status_text += f" ↓ {self.target_res.get()}"
-        code_map = {"av1": "AV1", "no_en_origen": "LISTO_LOCAL", "omitido": "OMITIDO",
+        code_map = {"av1": "AV1_REDUCIBLE", "av1_final": "AV1_LISTO",
+                    "no_en_origen": "LISTO_LOCAL", "omitido": "OMITIDO",
                     "nuevo": "NUEVO", "pendiente": "PENDIENTE", "desconocido": "DESCONOCIDO"}
         return status_text, source_text, tags, code_map.get(tags[0], "TODOS")
 
@@ -904,7 +948,7 @@ class TranscoderApp(ctk.CTk):
         rows = []
         for item in lib_files:
             status_text, source_text, tags, status_code = self._file_display_info(item)
-            if self.current_filter != "TODOS" and status_code != self.current_filter:
+            if not self._passes_filter(status_code):
                 continue
             db_entry = self.vistos_data.get(item['path'], {})
             if self.min_size_mb > 0 and (db_entry.get('size', 0) or 0) < self.min_size_mb * 1024 * 1024:
@@ -1044,8 +1088,12 @@ class TranscoderApp(ctk.CTk):
                 db_sz = self.vistos_data.get(item['path'], {}).get('size', 0) or 0
                 if db_sz < self.min_size_mb * 1024 * 1024:
                     continue
+            if self.only_above_target.get() and not self._exceeds_target(item['path']):
+                continue
+            status_text, source_text, tags, status_code = self._file_display_info(item)
+            if not self._passes_filter(status_code):
+                continue
             parent_iid = f"f:{rel_str}" if rel_str != "." and rel_str in inserted else ""
-            status_text, source_text, tags, _ = self._file_display_info(item)
             db_entry = self.vistos_data.get(item['path'], {})
             sz = _format_size(db_entry.get('size', 0))
             sub_text = self._sub_display(item['path'])
