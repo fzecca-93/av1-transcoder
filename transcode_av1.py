@@ -420,6 +420,8 @@ class TranscoderApp(ctk.CTk):
         self.saved_label.pack(side="left", padx=20, pady=5)
         self.processed_label = ctk.CTkLabel(stats_frame, text="Procesados: 0", font=("Segoe UI", 12))
         self.processed_label.pack(side="right", padx=20, pady=5)
+        self.eta_label = ctk.CTkLabel(stats_frame, text="Restante: —", font=("Segoe UI", 12), text_color="#3498db")
+        self.eta_label.pack(side="left", padx=20, pady=5)
 
         # ── Selector de modo de codificación ────────────────────────────────
         mode_frame = ctk.CTkFrame(self.tab_transcode)
@@ -723,6 +725,7 @@ class TranscoderApp(ctk.CTk):
 
         self.context_menu = tk.Menu(self, tearoff=0, bg="#2c3e50", fg="white", activebackground="#3498db")
         self.context_menu.add_command(label="+ Agregar a cola de transcodificación", command=self.enqueue_selected)
+        self.context_menu.add_command(label="⬇ Descargar del NAS (trabajar sin red)", command=self.download_selected)
         self.context_menu.add_command(label="🚫 Marcar como NO TRANSCODIFICAR", command=self.mark_no_transcode_selected)
         self.context_menu.add_command(label="↩ Desmarcar → volver a PENDIENTE", command=self.unmark_no_transcode_selected)
         self.context_menu.add_separator()
@@ -844,6 +847,29 @@ class TranscoderApp(ctk.CTk):
             self.target_hint.configure(
                 text="(objetivo: Original — nada se reduce)", text_color="#e67e22")
 
+    def _descargados(self) -> set:
+        """Rutas de origen que ya tienen su copia local, listas para trabajar sin red.
+
+        Se resuelve con un solo listado por dibujado, comparando por nombre.
+        """
+        cache = getattr(self, "_descargados_cache", None)
+        if cache is not None:
+            return cache
+        nombres = {}
+        try:
+            for f in self._local_input_dir().iterdir():
+                if f.is_file():
+                    nombres[f.name] = f.stat().st_size
+        except OSError:
+            pass
+        cache = set()
+        for path_str, entry in self.vistos_data.items():
+            tam = nombres.get(Path(path_str).name)
+            if tam is not None and (not entry.get("size") or tam == entry["size"]):
+                cache.add(path_str)
+        self._descargados_cache = cache
+        return cache
+
     def _height_of(self, path_str) -> int:
         """Alto guardado en la DB, o 0 si el archivo todavía no fue analizado."""
         media = (self.vistos_data.get(path_str) or {}).get("media") or {}
@@ -865,7 +891,8 @@ class TranscoderApp(ctk.CTk):
 
     def render_library(self):
         self._render_gen += 1
-        self._out_dir_cache = {}   # se relee la carpeta de salida en cada dibujado
+        self._out_dir_cache = {}       # se relee la carpeta de salida en cada dibujado
+        self._descargados_cache = None # ídem para las copias locales
         children = self.tree.get_children()
         if children:
             self.tree.delete(*children)
@@ -928,6 +955,8 @@ class TranscoderApp(ctk.CTk):
                 status_text += f"  ·  {alto}p"
                 if self._exceeds_target(item['path']):
                     status_text += f" ↓ {self.target_res.get()}"
+            if item['path'] in self._descargados():
+                status_text += "  ·  ⬇ descargado"
         code_map = {"av1": "AV1_REDUCIBLE", "av1_final": "AV1_LISTO",
                     "no_en_origen": "LISTO_LOCAL", "omitido": "OMITIDO",
                     "nuevo": "NUEVO", "pendiente": "PENDIENTE", "desconocido": "DESCONOCIDO"}
@@ -1303,6 +1332,102 @@ class TranscoderApp(ctk.CTk):
             return False
         return True
 
+    @staticmethod
+    def _resumen_cambio(origen: dict, salida: dict, tam_orig: int, tam_nuevo: int) -> str:
+        """Describe qué se le hizo al archivo: codec, resolución y cuánto pesa menos."""
+        partes = []
+
+        c_in = (origen.get("codec") or "?").upper()
+        c_out = (salida.get("codec") or "AV1").upper()
+        partes.append(f"{c_in} → {c_out}" if c_in != c_out else f"{c_out} (mismo codec)")
+
+        h_in, h_out = origen.get("height"), salida.get("height")
+        if h_in and h_out:
+            if h_in != h_out:
+                pix = 1 - (h_out * h_out) / (h_in * h_in)
+                partes.append(f"{h_in}p → {h_out}p (−{pix*100:.0f}% de píxeles)")
+            else:
+                partes.append(f"{h_in}p (misma resolución)")
+
+        mb_in, mb_out = tam_orig / 1024 / 1024, tam_nuevo / 1024 / 1024
+        pct = (1 - tam_nuevo / tam_orig) * 100 if tam_orig else 0
+        partes.append(f"{mb_in:,.0f} MB → {mb_out:,.0f} MB  (−{mb_in - mb_out:,.0f} MB, −{pct:.0f}%)")
+        return "  ·  ".join(partes)
+
+    # ── Estimación de lo que falta ──────────────────────────────────────────
+    # El encode avanza a un múltiplo de la duración del video (unas 20x en esta
+    # máquina). Se arranca con esa referencia y se va corrigiendo con la
+    # velocidad real de esta tanda, que depende del codec y la resolución.
+    VELOCIDAD_INICIAL = 20.0
+
+    @staticmethod
+    def _formato_duracion(segundos: float) -> str:
+        segundos = max(0, int(segundos))
+        h, m = divmod(segundos // 60, 60)
+        if h:
+            return f"{h}h {m:02d}m"
+        return f"{m}m" if m else "menos de 1m"
+
+    def _velocidad_actual(self) -> float:
+        """Segundos de video procesados por segundo de reloj."""
+        reloj = getattr(self, "_reloj_acumulado", 0.0)
+        video = getattr(self, "_video_acumulado", 0.0)
+        if reloj > 5 and video > 0:
+            return video / reloj
+        return self.VELOCIDAD_INICIAL
+
+    def _registrar_tiempo(self, duracion_video: float, segundos_reloj: float):
+        """Suma un archivo terminado para afinar la estimación."""
+        if duracion_video and segundos_reloj > 0:
+            self._video_acumulado = getattr(self, "_video_acumulado", 0.0) + duracion_video
+            self._reloj_acumulado = getattr(self, "_reloj_acumulado", 0.0) + segundos_reloj
+
+    def _priorizar_descargados(self):
+        """Adelanta al frente de la cola el primer archivo que ya esté en disco.
+
+        Si el que toca hay que bajarlo del NAS pero más atrás hay uno listo, se
+        codifica ese mientras la descarga del otro sigue en paralelo. Así no se
+        deja la GPU parada esperando a la red.
+        """
+        if len(self.transcode_queue) < 2:
+            return
+        if self._local_copy_of(Path(self.transcode_queue[0])):
+            return   # el primero ya está listo, nada que reordenar
+        for i, p in enumerate(self.transcode_queue):
+            if i == 0:
+                continue
+            if self._local_copy_of(Path(p)):
+                self.transcode_queue.insert(0, self.transcode_queue.pop(i))
+                self.update_queue.put(("log",
+                    f"  [Cola] Se adelanta {Path(p).name} (ya descargado); "
+                    f"el resto se sigue bajando.\n"))
+                self.update_queue.put(("queue_updated", len(self.transcode_queue)))
+                return
+
+    def _estimado_restante(self) -> str:
+        """Texto con lo que falta para vaciar la cola."""
+        pendientes = list(self.transcode_queue)
+        if not pendientes:
+            return "Restante: —"
+
+        duraciones = []
+        sin_datos = 0
+        for p in pendientes:
+            dur = ((self.vistos_data.get(p) or {}).get("media") or {}).get("duration")
+            if dur:
+                duraciones.append(dur)
+            else:
+                sin_datos += 1
+        if not duraciones:
+            return f"Restante: {len(pendientes)} archivo(s) · sin datos para estimar"
+
+        # A los no analizados se les asigna la duración media de los conocidos.
+        total_video = sum(duraciones) + sin_datos * (sum(duraciones) / len(duraciones))
+        texto = f"Restante: {len(pendientes)} archivo(s) · ~{self._formato_duracion(total_video / self._velocidad_actual())}"
+        if sin_datos:
+            texto += f" ({sin_datos} sin analizar)"
+        return texto
+
     def _resolution_args(self) -> list:
         """Argumentos de escalado para HandBrake según la resolución elegida."""
         dims = RESOLUTIONS.get(self.target_res.get())
@@ -1340,6 +1465,90 @@ class TranscoderApp(ctk.CTk):
         except ValueError:
             return None
         return self._output_path(src, out_r, rel)
+
+    # ── Trabajo sin red ─────────────────────────────────────────────────────
+    # Los archivos se pueden bajar del NAS por adelantado y transcodificarlos
+    # más tarde sin acceso a la red. La copia va a la misma carpeta que usa el
+    # transcodificador, así que después la encuentra sola.
+
+    def _local_input_dir(self) -> Path:
+        return Path(self.output_dir.get()) / "temp" / "Input"
+
+    def _local_copy_of(self, src: Path):
+        """Copia local completa de este origen, o None.
+
+        El tamaño se contrasta contra el que guarda la DB, no contra el archivo
+        del NAS: sin red no habría con qué comparar, y una copia a medias tiene
+        que descartarse igual.
+        """
+        li = self._local_input_dir() / src.name
+        try:
+            local_size = li.stat().st_size
+        except OSError:
+            return None
+        esperado = (self.vistos_data.get(str(src)) or {}).get("size")
+        if esperado and local_size != esperado:
+            return None
+        return li
+
+    def download_selected(self):
+        """Baja los archivos elegidos para poder transcodificarlos sin el NAS."""
+        selected = [s for s in self.tree.selection() if not s.startswith("f:")]
+        if not selected:
+            return
+        if not self.output_dir.get():
+            messagebox.showwarning("Sin destino", "Configurá la carpeta de destino de la librería.")
+            return
+        total_gb = sum((self.vistos_data.get(p, {}).get('size', 0) or 0)
+                       for p in selected) / 1024**3
+        if not messagebox.askyesno(
+            "Descargar para trabajar sin red",
+            f"Se van a copiar {len(selected)} archivo(s) ({total_gb:.1f} GB) a:\n\n"
+            f"{self._local_input_dir()}\n\n"
+            f"Después vas a poder transcodificarlos sin estar conectado al NAS.\n\n¿Continuar?",
+        ):
+            return
+        self.is_scanning = True
+        threading.Thread(target=self.download_worker, args=(selected,), daemon=True).start()
+
+    def download_worker(self, paths):
+        self.prevent_sleep()
+        dest_dir = self._local_input_dir()
+        dest_dir.mkdir(parents=True, exist_ok=True)
+        bajados = ya_estaban = fallidos = 0
+        try:
+            for idx, path_str in enumerate(paths, 1):
+                if not self.is_scanning:
+                    self.update_queue.put(("log", "Descarga cancelada por el usuario.\n"))
+                    break
+                src = Path(path_str)
+                if self._local_copy_of(src):
+                    ya_estaban += 1
+                    self.update_queue.put(("scan_progress",
+                        f"[{idx}/{len(paths)}] Ya estaba local: {src.name}"))
+                    continue
+                self.update_queue.put(("status", {"file": src.name, "action": "Descargando del NAS..."}))
+                self.update_queue.put(("scan_progress", f"[{idx}/{len(paths)}] Descargando: {src.name}"))
+                dst = dest_dir / src.name
+                if self._copy_with_progress(src, dst, sigue=lambda: self.is_scanning):
+                    bajados += 1
+                    self.update_queue.put(("log", f"[Local] Descargado: {src.name}\n"))
+                else:
+                    fallidos += 1
+                    if dst.exists():
+                        dst.unlink()
+        finally:
+            self.allow_sleep()
+            self.is_scanning = False
+
+        msg = f"Descarga terminada: {bajados} nuevo(s)"
+        if ya_estaban:
+            msg += f", {ya_estaban} ya estaban"
+        if fallidos:
+            msg += f", {fallidos} con error"
+        self.update_queue.put(("log", f"{msg}.\n"))
+        self.update_queue.put(("scan_progress", msg))
+        self.update_queue.put(("scan_done", None))
 
     def find_existing_output(self, src_str):
         """Busca el AV1 ya generado para este origen, en la carpeta de salida.
@@ -1758,11 +1967,24 @@ class TranscoderApp(ctk.CTk):
                     self.total_savings_mb += data['savings']
                     self.files_processed += 1
                     self.saved_label.configure(text=f"Total: {self.total_savings_mb:.2f} MB")
+                    self.processed_label.configure(text=f"Procesados: {self.files_processed}")
                 elif task == "queue_updated":
                     self._update_queue_button()
                 elif task == "finished":
                     self.is_processing = False
+                    self.eta_label.configure(text="Restante: —")
                     self.start_button.configure(text="INICIAR TRANSCODIFICACIÓN")
+                    # Sin esto la pantalla queda con el último estado ("Moviendo
+                    # resultado al destino...") y parece que sigue trabajando.
+                    pendientes = len(self.transcode_queue)
+                    self.current_file_label.configure(
+                        text="Detenido — quedan archivos en la cola" if pendientes
+                        else "Sin tareas pendientes")
+                    self.current_action_label.configure(
+                        text=f"Estado: listo — {self.files_processed} archivo(s) procesados"
+                             + (f", {pendientes} en espera" if pendientes else ""))
+                    self.progress_bar.set(0)
+                    self.percentage_label.configure(text="0%")
                     self.render_library()
                     self._update_lib_count()
                 elif task == "scan_progress":
@@ -1831,8 +2053,14 @@ class TranscoderApp(ctk.CTk):
         finally:
             self.allow_sleep()
 
-    def _copy_with_progress(self, src: Path, dst: Path) -> bool:
-        """Copia src→dst reportando progreso en la barra. Retorna True si OK."""
+    def _copy_with_progress(self, src: Path, dst: Path, sigue=None) -> bool:
+        """Copia src→dst reportando progreso en la barra. Retorna True si OK.
+
+        `sigue` es la condición para continuar; por defecto la transcodificación
+        en curso, pero la descarga previa corre sin ella y usa la suya.
+        """
+        if sigue is None:
+            sigue = lambda: self.is_processing
         try:
             total = src.stat().st_size
         except Exception as e:
@@ -1843,7 +2071,7 @@ class TranscoderApp(ctk.CTk):
         try:
             with open(src, 'rb') as fsrc, open(dst, 'wb') as fdst:
                 while True:
-                    if not self.is_processing:
+                    if not sigue():
                         return False
                     chunk = fsrc.read(CHUNK)
                     if not chunk:
@@ -1864,11 +2092,18 @@ class TranscoderApp(ctk.CTk):
     def _update_db_entry(self, src: Path, is_av1, identified_by, seen=True):
         """Actualiza la entrada en vistos_data preservando campos existentes (subtítulos, etc.)."""
         try:
-            fstat = src.stat()
             existing = self.vistos_data.get(str(src), {})
+            try:
+                fstat = src.stat()
+                mtime, size = fstat.st_mtime, fstat.st_size
+            except OSError:
+                # Sin acceso al origen (trabajando sin red) se conservan los
+                # datos ya guardados: el estado no se puede perder por eso.
+                mtime = existing.get("mtime", 0)
+                size = existing.get("size", 0)
             self.vistos_data[str(src)] = {
                 **existing,
-                "mtime": fstat.st_mtime, "size": fstat.st_size,
+                "mtime": mtime, "size": size,
                 "is_av1": is_av1, "seen": seen, "identified_by": identified_by
             }
             self.save_vistos()
@@ -1892,6 +2127,15 @@ class TranscoderApp(ctk.CTk):
                 return
 
             li = tmp / "Input" / src.name
+
+            # Si ya se descargó por adelantado, no hay nada que traer: volver a
+            # bajarlo tiraría el trabajo hecho y exigiría el NAS otra vez.
+            if self._local_copy_of(src):
+                result['ready'] = True
+                self.update_queue.put(("log",
+                    f"  [Pipeline] {src.name} ya estaba descargado.\n"))
+                return
+
             if li.exists():
                 li.unlink()
 
@@ -1929,6 +2173,10 @@ class TranscoderApp(ctk.CTk):
             self._update_db_entry(src, is_av1=True, identified_by="Verificación directa")
             return
 
+        # Ficha del origen (ya cacheada por la verificación de codec), para poder
+        # contar después qué cambió realmente.
+        origen = self.get_media_info(src) or {}
+
         ff = self._output_path(src, out_r, src.parent.relative_to(in_r))
         of = ff.name
         if ff.exists():
@@ -1938,9 +2186,16 @@ class TranscoderApp(ctk.CTk):
         li, lo = tmp / "Input" / src.name, tmp / "Output" / of
 
         # ── Fase 1: Copia NAS → local (saltar si el pipeline ya lo hizo) ─────
+        ya_local = self._local_copy_of(src) is not None
+        procesado_ok = False
         if prefetch_data and prefetch_data.get('ready') and li.exists():
             self.update_queue.put(("status", {"file": src.name, "action": "Pre-carga lista (pipeline) ✓"}))
             self.update_queue.put(("progress", 100))
+        elif ya_local:
+            # Descargado de antemano: no hace falta el NAS para nada más.
+            self.update_queue.put(("status", {"file": src.name, "action": "Ya descargado ✓"}))
+            self.update_queue.put(("progress", 100))
+            self.update_queue.put(("log", f"  [Local] Usando la copia descargada de {src.name}\n"))
         else:
             self.update_queue.put(("status", {"file": src.name, "action": "Copiando desde NAS..."}))
             self.update_queue.put(("progress", 0))
@@ -2103,9 +2358,16 @@ class TranscoderApp(ctk.CTk):
 
             # ── Verificar tamaño y mover al destino ───────────────────────────
             try:
-                original_size = src.stat().st_size
+                # Sin red no se puede consultar el original: vale el tamaño que
+                # guarda la DB, y si no, el de la copia local que se codificó.
+                try:
+                    original_size = src.stat().st_size
+                except OSError:
+                    original_size = ((self.vistos_data.get(str(src)) or {}).get("size")
+                                     or li.stat().st_size)
                 new_size      = lo.stat().st_size
                 if new_size >= 0.9 * original_size:
+                    procesado_ok = True   # decisión tomada: la descarga ya no hace falta
                     self._update_db_entry(src, is_av1="NO_TRANSCODIFICAR", identified_by="Filtro Tamaño")
                     self.update_queue.put(("log",
                         f"OMITIDO (no ahorra suficiente): {src.name} "
@@ -2113,11 +2375,23 @@ class TranscoderApp(ctk.CTk):
                 else:
                     self.update_queue.put(("action", "Moviendo resultado al destino..."))
                     s = (original_size - new_size) / (1024 * 1024)
+                    # Se lee el resultado ANTES de moverlo: está en disco local,
+                    # así que sale barato y da la resolución real, no la supuesta.
+                    salida = self.probe_media(lo, save=False) or {}
                     if self.safe_io(shutil.move, lo, ff):
+                        procesado_ok = True
                         self.update_queue.put(("stats", {"savings": s}))
                         self._update_db_entry(src, is_av1=True, identified_by="Transcodificado")
-                        self.update_queue.put(("log", f"OK: {src.name}  (−{s:.1f} MB)\n"))
-                        self.handle_subtitles(src, ff.parent, ff.stem)
+                        self.update_queue.put(("log", f"OK: {src.name}\n"))
+                        self.update_queue.put(("log", "     " + self._resumen_cambio(
+                            origen, salida, original_size, new_size) + "\n"))
+                        # Los subtítulos viven junto al original: sin red no se
+                        # pueden copiar, y eso no debe invalidar el video ya hecho.
+                        try:
+                            self.handle_subtitles(src, ff.parent, ff.stem)
+                        except Exception as sub_err:
+                            self.update_queue.put(("log",
+                                f"  [Subs] No se pudieron copiar: {sub_err}\n"))
             except Exception as e:
                 self.update_queue.put(("log", f"Error post-proceso {src.name}: {e}\n"))
                 self._update_db_entry(src, is_av1=False, identified_by="Error post-proceso")
@@ -2126,7 +2400,13 @@ class TranscoderApp(ctk.CTk):
             self._update_db_entry(src, is_av1=False, identified_by="Error HandBrake")
 
         if li.exists():
-            li.unlink()
+            if ya_local and not procesado_ok:
+                # Se descargó a propósito y no llegó a procesarse: si se borra,
+                # sin red no habría forma de recuperarla para reintentar.
+                self.update_queue.put(("log",
+                    f"  [Local] Se conserva la copia de {src.name} para reintentar.\n"))
+            else:
+                li.unlink()
         if lo.exists():
             lo.unlink()
         if lo_audio and lo_audio.exists():
@@ -2236,6 +2516,8 @@ class TranscoderApp(ctk.CTk):
         self.scan_status_label.configure(text=msg)
 
     def _update_queue_button(self):
+        if hasattr(self, "eta_label"):
+            self.eta_label.configure(text=self._estimado_restante())
         n = len(self.transcode_queue)
         if n == 0:
             self.queue_btn.configure(text="Cola vacía", state="disabled", fg_color="#2c3e50")
@@ -2444,9 +2726,27 @@ class TranscoderApp(ctk.CTk):
             (temp_dir / "Output").mkdir(parents=True, exist_ok=True)
 
             # ── Pipeline de pre-carga continua ───────────────────────────────
-            # Máximo de archivos pre-descargados esperando en cola (ajustar según
-            # espacio en disco local; 2 es un balance razonable).
+            # Cuántos archivos bajados pueden esperar su turno. El límite existe
+            # por espacio en disco: cada uno ocupa lo que pese el original.
             MAX_PREFETCH_AHEAD = 2
+
+            def _proximo_a_bajar():
+                """Primer archivo de la cola que todavía haya que traer del NAS.
+
+                Se saltean los que ya están en disco: si la cola arranca con 15
+                locales y 5 remotos, las descargas empiezan de entrada por esos 5
+                en vez de esperar a que el turno llegue hasta ellos.
+                """
+                for i, p in enumerate(self.transcode_queue):
+                    if i == 0:
+                        continue   # el que se está codificando ahora
+                    with prefetch_lock:
+                        if p in prefetch_cache:
+                            continue
+                    if self._local_copy_of(Path(p)):
+                        continue   # ya está: no hay nada que descargar
+                    return p
+                return None
 
             prefetch_cache   = {}   # path_str → result dict (listo o en progreso)
             prefetch_threads = {}   # path_str → Thread
@@ -2470,15 +2770,9 @@ class TranscoderApp(ctk.CTk):
                         buffered = sum(1 for k in prefetch_cache if k != current)
                     if buffered >= MAX_PREFETCH_AHEAD:
                         return
-                    # Buscar el primer archivo de la cola sin pre-carga (omitir índice 0)
-                    for i, p in enumerate(self.transcode_queue):
-                        if i == 0:
-                            continue
-                        with prefetch_lock:
-                            already = p in prefetch_cache
-                        if not already:
-                            _launch_prefetch_for(p)
-                            break
+                    siguiente = _proximo_a_bajar()
+                    if siguiente:
+                        _launch_prefetch_for(siguiente)
 
                 def _worker():
                     self._prefetch_verify_and_copy(src_p, input_root, output_root, temp_dir, result)
@@ -2492,10 +2786,15 @@ class TranscoderApp(ctk.CTk):
                     f"  [Pipeline] Iniciando pre-carga: {src_p.name}\n"))
 
             while self.transcode_queue and self.is_processing:
+                # Primero lo que ya está en disco, así la GPU nunca espera a la
+                # red: mientras se codifica, el pipeline sigue bajando el resto.
+                self._priorizar_descargados()
+
                 path_str = self.transcode_queue[0]
                 src = Path(path_str)
 
-                if not src.exists():
+                # Un origen inaccesible no importa si ya se descargó la copia.
+                if not src.exists() and not self._local_copy_of(src):
                     self.update_queue.put(("log", f"Archivo no encontrado, saltando: {src.name}\n"))
                     self.transcode_queue.pop(0)
                     with prefetch_lock:
@@ -2510,7 +2809,10 @@ class TranscoderApp(ctk.CTk):
                     t_ref = prefetch_threads.get(path_str)
                 if t_ref is not None:
                     if t_ref.is_alive():
-                        self.update_queue.put(("action", f"Esperando pre-carga de {src.name}..."))
+                        # Con "action" a secas el título seguía mostrando el archivo
+                        # anterior y parecía que se esperaba por otra cosa.
+                        self.update_queue.put(("status", {"file": src.name,
+                                                          "action": "Esperando que termine su descarga..."}))
                         t_ref.join()
                     with prefetch_lock:
                         cached = prefetch_cache.get(path_str, {})
@@ -2524,24 +2826,31 @@ class TranscoderApp(ctk.CTk):
                     self.update_queue.put(("queue_updated", len(self.transcode_queue)))
                     continue
 
-                # Callback justo antes de HandBrake: lanzar la siguiente pre-carga
-                # (y ella misma encadenará la siguiente cuando termine)
+                # Callback justo antes de HandBrake: llenar el buffer de descargas.
+                # Se lanzan varias de una, no una sola: si la cola empieza con
+                # muchos locales, las descargas de los remotos arrancan ya y para
+                # cuando les toque el turno están listas.
                 def start_next_prefetch():
-                    for i, p in enumerate(self.transcode_queue):
-                        if i == 0:
-                            continue  # archivo en proceso actual
+                    for _ in range(MAX_PREFETCH_AHEAD):
+                        current = self.transcode_queue[0] if self.transcode_queue else None
                         with prefetch_lock:
-                            already = p in prefetch_cache
-                        if not already:
-                            _launch_prefetch_for(p)
-                            break
+                            buffered = sum(1 for k in prefetch_cache if k != current)
+                        if buffered >= MAX_PREFETCH_AHEAD:
+                            return
+                        siguiente = _proximo_a_bajar()
+                        if not siguiente:
+                            return
+                        _launch_prefetch_for(siguiente)
 
+                duracion_src = ((self.vistos_data.get(path_str) or {}).get("media") or {}).get("duration")
+                t_inicio = time.time()
                 try:
                     self.process_single_file(src, input_root, output_root, temp_dir,
                                              on_transcode_start=start_next_prefetch,
                                              prefetch_data=cached)
                 except Exception as e:
                     self.update_queue.put(("log", f"Error procesando {src.name}: {e}\n"))
+                self._registrar_tiempo(duracion_src, time.time() - t_inicio)
 
                 if self.transcode_queue and self.transcode_queue[0] == path_str:
                     self.transcode_queue.pop(0)
