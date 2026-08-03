@@ -43,9 +43,16 @@ RESOLUTIONS = {
 CQ_CHOICES = ["Auto"] + [str(q) for q in range(22, 39, 2)]
 CQ_AUTO = {"Anime / Dibujos": 32, "Pelicula / Serie": 30}
 # Etiqueta de resolución dentro del nombre del archivo (para renombrar la salida).
-RES_NAME_TAG = re.compile(r"(?i)\b(2160p|1440p|1080p|720p|576p|480p|4k|uhd)\b")
-TAG_HEIGHT = {"2160p": 2160, "4k": 2160, "uhd": 2160, "1440p": 1440,
-              "1080p": 1080, "720p": 720, "576p": 576, "480p": 480}
+# Acepta cualquier altura, no solo las habituales: hay material como "404p".
+RES_NAME_TAG = re.compile(r"(?i)\b(\d{3,4}p|4k|uhd)\b")
+
+
+def _tag_height(tag: str) -> int:
+    """Altura en píxeles que representa una etiqueta del nombre ('720p' -> 720)."""
+    t = tag.lower()
+    if t in ("4k", "uhd"):
+        return 2160
+    return int(t[:-1])
 
 
 def get_db_filename(library_name):
@@ -76,6 +83,7 @@ class TranscoderApp(ctk.CTk):
         self.denoise_level = tk.StringVar(value="Normal")   # Suave | Normal | Fuerte
         self.target_res    = tk.StringVar(value="Original") # Original | 1080p | 720p
         self.target_cq     = tk.StringVar(value="Auto")     # Auto | "22".."38"
+        self.hw_decode     = tk.BooleanVar(value=False)     # decodificar con NVDEC
 
         # Multi-library state
         self.libraries = []   # [{name, input_dir, output_dir}, ...]
@@ -479,6 +487,25 @@ class TranscoderApp(ctk.CTk):
         self.cq_info_label.grid(row=3, column=2, padx=(0, 15), pady=(0, 10), sticky="e")
         self._on_cq_changed(self.target_cq.get())
 
+        # ── Fila 4: decodificación por GPU ──────────────────────────────────
+        ctk.CTkLabel(mode_frame, text="GPU:", font=("Segoe UI", 12, "bold")).grid(
+            row=4, column=0, padx=(15, 10), pady=(0, 10), sticky="w")
+        self.hw_decode_check = ctk.CTkCheckBox(
+            mode_frame,
+            text="Decodificar en la GPU (NVDEC)  ·  libera CPU pero tarda más",
+            variable=self.hw_decode,
+            command=self._on_hw_decode_changed,
+            font=("Segoe UI", 11),
+        )
+        self.hw_decode_check.grid(row=4, column=1, padx=10, pady=(0, 10), sticky="w")
+        self.hw_info_label = ctk.CTkLabel(
+            mode_frame,
+            text="",
+            font=("Segoe UI", 11),
+        )
+        self.hw_info_label.grid(row=4, column=2, padx=(0, 15), pady=(0, 10), sticky="e")
+        self._on_hw_decode_changed()
+
         self.log_text = ctk.CTkTextbox(self.tab_transcode, font=("Consolas", 11), fg_color="#121212")
         self.log_text.grid(row=4, column=0, padx=10, pady=5, sticky="nsew")
         self.start_button = ctk.CTkButton(self.tab_transcode, text="INICIAR TRANSCODIFICACIÓN", height=45, command=self.toggle_processing)
@@ -523,6 +550,17 @@ class TranscoderApp(ctk.CTk):
                 text="Mantiene la resolución del origen", text_color="#888888"
             )
 
+    def _on_hw_decode_changed(self):
+        """Avisa qué parte del trabajo queda en la GPU."""
+        if self.hw_decode.get():
+            self.hw_info_label.configure(
+                text="~35% más lento · PC más usable", text_color="#e67e22"
+            )
+        else:
+            self.hw_info_label.configure(
+                text="Máxima velocidad (recomendado)", text_color="#888888"
+            )
+
     def _on_cq_changed(self, value):
         """Muestra el CQ que se va a usar realmente."""
         cq = self._effective_cq()
@@ -546,7 +584,7 @@ class TranscoderApp(ctk.CTk):
         self.import_excel_button = ctk.CTkButton(ctrl_frame, text="2. IMPORTAR EXCEL JELLYFIN", width=220, fg_color="#27ae60", hover_color="#219150", command=self.import_jellyfin_excel)
         self.import_excel_button.pack(side="left", padx=5, pady=10)
 
-        self.deep_scan_button = ctk.CTkButton(ctrl_frame, text="3. ANALIZAR RESTO (MediaInfo)", width=220, fg_color="#8e44ad", hover_color="#7d3c98", command=self.start_deep_scan)
+        self.deep_scan_button = ctk.CTkButton(ctrl_frame, text="3. ANALIZAR ARCHIVOS", width=220, fg_color="#8e44ad", hover_color="#7d3c98", command=self.start_deep_scan)
         self.deep_scan_button.pack(side="left", padx=5, pady=10)
 
         self.cleanup_button = ctk.CTkButton(ctrl_frame, text="Limpiar faltantes", width=130, fg_color="#7f8c8d", hover_color="#6d7a8a", command=self.start_cleanup)
@@ -655,7 +693,7 @@ class TranscoderApp(ctk.CTk):
         self.context_menu.add_command(label="Mover local a NAS y borrar original", command=self.move_to_nas_selected)
         self.context_menu.add_separator()
         self.context_menu.add_command(label="🔇 Mejorar audio (solo denoise, sin video)", command=self.improve_audio_selected)
-        self.context_menu.add_command(label="Analizar a fondo (MediaInfo)", command=self.analyze_selected)
+        self.context_menu.add_command(label="Analizar a fondo (releer datos del archivo)", command=self.analyze_selected)
         self.context_menu.add_command(label="Abrir carpeta", command=self.open_selected_folder)
         self.tree.bind("<Button-3>", self.show_context_menu)
 
@@ -1150,7 +1188,7 @@ class TranscoderApp(ctk.CTk):
                 # El nombre no dice la resolución: marcamos la salida para no
                 # pisar una copia previa hecha en "Original".
                 ns += f".{res}"
-            elif dims[1] < max(TAG_HEIGHT[t.lower()] for t in tags):
+            elif dims[1] < max(_tag_height(t) for t in tags):
                 # Solo renombramos si hubo downscale real; HandBrake nunca
                 # amplía, así que un 720p en modo 1080p conserva su nombre.
                 ns = RES_NAME_TAG.sub(res, ns)
@@ -1161,12 +1199,13 @@ class TranscoderApp(ctk.CTk):
     def _skip_because_already_av1(self, src: Path) -> bool:
         """Un AV1 se saltea salvo que se haya pedido bajarlo de resolución y el
         origen esté por encima del objetivo (ej. AV1 1080p → 720p)."""
-        if not self.check_is_av1(src):
+        info = self.get_media_info(src) or {}
+        if "av1" not in (info.get("codec") or ""):
             return False
         dims = RESOLUTIONS.get(self.target_res.get())
         if not dims:
             return True
-        h = self.probe_height(src)
+        h = info.get("height")
         if h is None:
             # Sin dato de altura no arriesgamos una recodificación al pedo.
             self.update_queue.put(("log",
@@ -1337,14 +1376,16 @@ class TranscoderApp(ctk.CTk):
         re_av1 = re.compile(r"(?i)AV1")
         re_others = re.compile(r"(?i)x264|h264|h\.264|x265|h265|h\.265|hevc|avc")
 
-        # Eliminar de la DB los archivos que ya no existen en disco
-        deleted_paths = [p for p in list(self.vistos_data.keys()) if not Path(p).exists()]
-        for p in deleted_paths:
-            del self.vistos_data[p]
-        self.all_found_files = [f for f in self.all_found_files if f['path'] not in deleted_paths]
-
-        # Build a set of known paths for O(1) lookup
+        # Los archivos borrados se deducen del recorrido, comparando al final lo
+        # que hay en disco contra lo que hay en la DB. Antes se preguntaba por
+        # cada entrada de TODA la base (una consulta al NAS por archivo, aunque
+        # fuera de otra librería), lo que hacía esperar minutos antes de empezar
+        # y borraba entradas en masa si otra unidad estaba desconectada.
         known_paths = set(self.vistos_data.keys())
+        listed_paths = {f['path'] for f in self.all_found_files}
+        found_paths = set()
+        deleted_paths = []
+        sub_cache = {}
 
         new_count = 0
         total_walked = 0
@@ -1360,25 +1401,27 @@ class TranscoderApp(ctk.CTk):
 
                     f_str = str(filepath)
                     total_walked += 1
+                    found_paths.add(f_str)
 
                     if total_walked % 50 == 0:
-                        del_msg = f" | Eliminados: {len(deleted_paths)}" if deleted_paths else ""
-                        self.update_queue.put(("scan_progress", f"Revisados: {total_walked} | Nuevos: {new_count}{del_msg}..."))
+                        self.update_queue.put(("scan_progress", f"Revisados: {total_walked} | Nuevos: {new_count}..."))
 
                     if f_str in known_paths:
-                        # Already in DB — add to file list if missing (e.g. first run after restart)
-                        if not any(f['path'] == f_str for f in self.all_found_files):
+                        # Ya está en la DB; solo falta en la lista en memoria tras reiniciar.
+                        if f_str not in listed_paths:
                             self.all_found_files.append({"name": file, "path": f_str})
+                            listed_paths.add(f_str)
                         continue
 
                     # New file not in DB
                     new_count += 1
                     self.all_found_files.append({"name": file, "path": f_str})
+                    listed_paths.add(f_str)
                     try:
                         sz = filepath.stat().st_size
                     except Exception:
                         sz = 0
-                    subs = self._detect_subtitle_langs(filepath)
+                    subs = self._detect_subtitle_langs(filepath, sub_cache)
                     if re_av1.search(file):
                         self.vistos_data[f_str] = {"mtime": 0, "is_av1": True, "seen": False, "identified_by": "Nombre", "size": sz, "subtitles": subs}
                     elif re_others.search(file):
@@ -1389,6 +1432,21 @@ class TranscoderApp(ctk.CTk):
         except Exception as e:
             self.update_queue.put(("log", f"Error en escaneo: {e}\n"))
 
+        # Poda: solo entradas de ESTA carpeta que el recorrido no encontró. Si el
+        # escaneo se canceló a mitad no se borra nada, porque lo no recorrido
+        # parecería inexistente.
+        if self.is_scanning:
+            # El separador final evita que "Y:\Videos" se lleve puesto "Y:\Videos2".
+            raiz = os.path.join(str(path_root), "")
+            deleted_paths = [p for p in known_paths
+                             if p not in found_paths and p.startswith(raiz)]
+            for p in deleted_paths:
+                self.vistos_data.pop(p, None)
+            if deleted_paths:
+                borrados = set(deleted_paths)
+                self.all_found_files = [f for f in self.all_found_files
+                                        if f['path'] not in borrados]
+
         self.save_vistos()
         deleted_msg = f" | {len(deleted_paths)} eliminados" if deleted_paths else ""
         self.update_queue.put(("scan_progress", f"Scan completado: {new_count} nuevos encontrados ({total_walked} revisados){deleted_msg}."))
@@ -1398,14 +1456,83 @@ class TranscoderApp(ctk.CTk):
         threading.Thread(target=self.deep_scan_worker, args=([path],), daemon=True).start()
 
     def start_deep_scan(self):
+        # Además de los archivos sin identificar, se reanalizan los que todavía
+        # no tienen la ficha de medios (codec, resolución, duración, etc.).
         pending = [f['path'] for f in self._get_lib_files()
                    if f['path'] not in self.vistos_data
-                   or self.vistos_data[f['path']].get('identified_by') in ('Nombre', 'Pendiente')]
+                   or self.vistos_data[f['path']].get('identified_by') in ('Nombre', 'Pendiente')
+                   or not self.vistos_data[f['path']].get('media')]
         if not pending:
             messagebox.showinfo("Info", "No hay archivos pendientes de análisis profundo.")
             return
+
+        # Ritmo medido contra el NAS con los 4 hilos: ~125 archivos por minuto.
+        minutos = len(pending) / 125
+        estimado = f"{minutos:.0f} minuto(s)" if minutos >= 1 else "menos de un minuto"
+        if not messagebox.askyesno(
+            "Análisis profundo",
+            f"Se van a analizar {len(pending)} archivo(s).\n\n"
+            f"Se leen codec, resolución, duración, bitrate, audios y subtítulos, "
+            f"y quedan guardados para no volver a consultar el NAS.\n\n"
+            f"Tiempo estimado: {estimado}.\n\n¿Continuar?",
+        ):
+            return
+
         self.deep_scan_button.configure(state="disabled", text="Analizando...")
         threading.Thread(target=self.deep_scan_worker, args=(pending,), daemon=True).start()
+
+    # Estados que significan "el trabajo ya se hizo", aunque el archivo de
+    # origen siga sin ser AV1. No deben perderse al reanalizar.
+    PROCESADO = ("Transcodificado", "Movido al NAS", "Salida ya existe",
+                 "AV1 en la carpeta")
+
+    @staticmethod
+    def _normalize_stem(stem: str) -> str:
+        """Nombre sin etiquetas de codec ni resolución, para emparejar
+        un original con el AV1 que se generó a partir de él."""
+        s = re.sub(r"(?i)x264|h264|h\.264|x265|h265|h\.265|hevc|avc|av1|xvid|divx", "", stem)
+        s = RES_NAME_TAG.sub("", s)
+        return re.sub(r"[\s._\-]+", " ", s).strip().lower()
+
+    def _has_av1_sibling(self, src: Path, dir_cache: dict) -> bool:
+        """¿Ya existe, en la misma carpeta, el AV1 hecho a partir de este archivo?
+
+        Es el caso de los archivos convertidos y movidos al NAS: el original
+        queda al lado del resultado. El listado se cachea por carpeta para no
+        recorrer el NAS una vez por archivo.
+        """
+        folder = src.parent
+        names = dir_cache.get(folder)
+        if names is None:
+            try:
+                names = [f.stem for f in folder.iterdir()
+                         if f.suffix.lower() in SUPPORTED_EXTENSIONS]
+            except OSError:
+                names = []
+            dir_cache[folder] = names
+        target = self._normalize_stem(src.stem)
+        if not target:
+            return False
+        for stem in names:
+            if stem == src.stem:
+                continue
+            if "av1" in stem.lower() and self._normalize_stem(stem) == target:
+                return True
+        return False
+
+    def _probe_for_scan(self, path_str):
+        """Sondea un archivo para el análisis profundo.
+
+        Devuelve (existe, stat, media). Resuelve existencia y stat de una sola
+        consulta al NAS, y se ejecuta dentro del pool para que las 4 vías
+        trabajen en paralelo desde el primer segundo.
+        """
+        p = Path(path_str)
+        try:
+            st = p.stat()
+        except OSError:
+            return (False, None, None)
+        return (True, st, self.probe_media(p, save=False))
 
     def deep_scan_worker(self, paths):
         self.prevent_sleep()
@@ -1414,35 +1541,66 @@ class TranscoderApp(ctk.CTk):
             completed = 0
             WORKERS = 4
             TIMEOUT_SEC = 30
+            dir_cache = {}   # carpeta -> nombres, para buscar AV1 hermanos
     
             self.update_queue.put(("deep_scan_start", total))
     
             with ThreadPoolExecutor(max_workers=WORKERS) as executor:
-                future_to_path = {executor.submit(self.check_is_av1, Path(p)): p for p in paths if Path(p).exists()}
+                # Un solo sondeo por archivo trae codec, resolución, duración,
+                # bitrate, audios y subtítulos; todo queda guardado en la DB.
+                # El chequeo de existencia va DENTRO del worker: hacerlo acá
+                # obligaba a recorrer todo el NAS antes de arrancar, y con
+                # cientos de archivos la barra tardaba minutos en moverse.
+                future_to_path = {executor.submit(self._probe_for_scan, p): p
+                                  for p in paths}
                 for future in as_completed(future_to_path):
                     p = future_to_path[future]
                     f_path = Path(p)
                     completed += 1
+                    media = fstat = None
+                    exists = True
                     try:
-                        is_av1 = future.result(timeout=TIMEOUT_SEC)
-                        identified_by = "MediaInfo"
+                        exists, fstat, media = future.result(timeout=TIMEOUT_SEC)
+                        identified_by = "Análisis" if media else "Pendiente"
                     except FuturesTimeoutError:
-                        is_av1 = None
                         identified_by = "Pendiente"
                         self.update_queue.put(("log", f"Timeout analizando: {f_path.name}\n"))
                     except Exception as e:
-                        is_av1 = None
                         identified_by = "Pendiente"
                         self.update_queue.put(("log", f"Error en {f_path.name}: {e}\n"))
-    
-                    fstat = f_path.stat() if f_path.exists() else None
-                    self.vistos_data[p] = {
+
+                    if not exists:
+                        # El archivo ya no está: se deja la entrada como estaba.
+                        self.update_queue.put(("deep_scan_progress", completed / total))
+                        continue
+
+                    prev = self.vistos_data.get(p, {})
+                    is_av1 = None
+                    if media:
+                        is_av1 = "av1" in (media.get("codec") or "")
+                        if not is_av1:
+                            # El origen no es AV1, pero el trabajo puede estar hecho:
+                            # o ya estaba marcado así, o el AV1 está en la carpeta.
+                            if prev.get("is_av1") is True and prev.get("identified_by") in self.PROCESADO:
+                                is_av1 = True
+                                identified_by = prev["identified_by"]
+                            elif self._has_av1_sibling(f_path, dir_cache):
+                                is_av1 = True
+                                identified_by = "AV1 en la carpeta"
+                    entry = {
                         "mtime": fstat.st_mtime if fstat else 0,
-                        "size": fstat.st_size if fstat else self.vistos_data.get(p, {}).get("size", 0),
+                        "size": fstat.st_size if fstat else prev.get("size", 0),
                         "is_av1": is_av1,
-                        "seen": self.vistos_data.get(p, {}).get("seen", False),
+                        "seen": prev.get("seen", False),
                         "identified_by": identified_by,
                     }
+                    if prev.get("subtitles") is not None:
+                        entry["subtitles"] = prev["subtitles"]
+                    if media:
+                        entry["media"] = media
+                    elif prev.get("media"):
+                        entry["media"] = prev["media"]
+                    self.vistos_data[p] = entry
                     self.update_queue.put(("scan_progress", f"Analizando {completed}/{total} ({WORKERS} en paralelo) — {f_path.name}"))
                     self.update_queue.put(("deep_scan_progress", completed / total))
                     if completed % 5 == 0:
@@ -1491,7 +1649,7 @@ class TranscoderApp(ctk.CTk):
                 elif task == "scan_done":
                     self.is_scanning = False
                     self.scan_button.configure(text="1. BUSCAR NUEVOS (NAS)", fg_color=("#3b8ed0", "#1f6aa5"), state="normal")
-                    self.deep_scan_button.configure(text="3. ANALIZAR RESTO (MediaInfo)", state="normal")
+                    self.deep_scan_button.configure(text="3. ANALIZAR ARCHIVOS", state="normal")
                     self.deep_scan_progress_bar.grid_remove()
                     self.render_library()
                     self._update_lib_count()
@@ -1733,11 +1891,19 @@ class TranscoderApp(ctk.CTk):
             self.update_queue.put(("log",
                 f"  [Video] Escalado a máx {res_args[1]}x{res_args[3]} (sin upscale)\n"))
 
+        # NVDEC baja el uso de CPU (7.7 -> 5.2 núcleos medidos sobre HEVC 1080p)
+        # pero tarda ~35% más: el escalado sigue en CPU, así que cada frame viaja
+        # GPU -> RAM -> GPU y ese ida y vuelta se come la ganancia. Por eso viene
+        # apagado: sirve para dejar la PC usable, no para ir más rápido.
+        hw_args = ["--enable-hw-decoding", "nvdec"] if self.hw_decode.get() else []
+        if hw_args:
+            self.update_queue.put(("log", "  [Video] Decodificación por GPU (NVDEC) activada\n"))
+
         self.update_queue.put(("status", {"file": src.name, "action": f"Transcodificando con GPU... {mode_tag}"}))
         self.update_queue.put(("progress", 0))
         cmd = [HANDBRAKE_CLI_PATH, "-i", str(li), "-o", str(lo),
                "-e", "nvenc_av1_10bit", "-q", quality, "--encoder-preset", "slow",
-               "--all-audio", "--all-subtitles"] + res_args + mode_args + audio_args
+               "--all-audio", "--all-subtitles"] + hw_args + res_args + mode_args + audio_args
         proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                                 text=True, encoding='utf-8', errors='replace',
                                 creationflags=subprocess.CREATE_NO_WINDOW)
@@ -2284,104 +2450,203 @@ class TranscoderApp(ctk.CTk):
         self.update_queue.put(("scan_progress", f"Limpieza completada: {removed} archivos eliminados."))
         self.update_queue.put(("cleanup_done", removed))
 
-    def _find_ffprobe(self):
-        if hasattr(self, '_ffprobe_cache'):
-            return self._ffprobe_cache
+    def _find_tool(self, name):
+        """Ubica ffmpeg/ffprobe devolviendo SIEMPRE una ruta absoluta.
+
+        Con rutas relativas CreateProcess falla ("no se encuentra el archivo"),
+        que es lo que hacía que ffprobe nunca se usara y todo cayera al
+        respaldo MediaInfo, mucho más lento.
+        """
+        exe = f"{name}.exe" if os.name == "nt" else name
+        bases = []
+        if getattr(sys, "frozen", False):
+            bases.append(Path(sys.executable).resolve().parent)
+        try:
+            bases.append(Path(__file__).resolve().parent)
+        except NameError:
+            pass
+        bases.append(Path.cwd())
         hb = shutil.which(HANDBRAKE_CLI_PATH)
         if hb:
-            candidate = Path(hb).parent / "ffprobe.exe"
+            bases.append(Path(hb).resolve().parent)
+        for base in bases:
+            candidate = base / exe
             if candidate.exists():
-                self._ffprobe_cache = str(candidate)
-                return self._ffprobe_cache
-        found = shutil.which("ffprobe")
-        self._ffprobe_cache = found
-        return found
+                return str(candidate.resolve())
+        found = shutil.which(name)
+        return str(Path(found).resolve()) if found else None
+
+    def _find_ffprobe(self):
+        if not hasattr(self, '_ffprobe_cache'):
+            self._ffprobe_cache = self._find_tool("ffprobe")
+        return self._ffprobe_cache
 
     def _find_ffmpeg(self):
-        if hasattr(self, '_ffmpeg_cache'):
-            return self._ffmpeg_cache
-        hb = shutil.which(HANDBRAKE_CLI_PATH)
-        if hb:
-            candidate = Path(hb).parent / "ffmpeg.exe"
-            if candidate.exists():
-                self._ffmpeg_cache = str(candidate)
-                return self._ffmpeg_cache
-        found = shutil.which("ffmpeg")
-        self._ffmpeg_cache = found
-        return found
+        if not hasattr(self, '_ffmpeg_cache'):
+            self._ffmpeg_cache = self._find_tool("ffmpeg")
+        return self._ffmpeg_cache
 
-    def _check_is_av1_ffprobe(self, p, ffprobe_path):
+    # ── Sondeo de medios ────────────────────────────────────────────────────
+    # Un único ffprobe trae codec, resolución, duración, bitrate, audios y
+    # subtítulos, y el resultado queda guardado en la DB. Antes cada dato salía
+    # de su propia llamada al NAS (~17 s por archivo), así que consultar la DB
+    # local en vez de la red es la diferencia entre segundos y horas.
+
+    def _probe_media_ffprobe(self, p, ffprobe_path):
+        """Devuelve el dict de medios, o None si ffprobe no pudo leer el archivo."""
         try:
             result = subprocess.run(
-                [ffprobe_path, "-v", "quiet", "-select_streams", "v:0",
-                 "-show_entries", "stream=codec_name", "-of", "csv=p=0", str(p)],
-                capture_output=True, text=True, timeout=15, encoding="utf-8", errors="replace",
+                [ffprobe_path, "-v", "quiet", "-print_format", "json",
+                 "-show_format", "-show_streams", str(p)],
+                capture_output=True, text=True, timeout=60,
+                encoding="utf-8", errors="replace",
                 creationflags=subprocess.CREATE_NO_WINDOW
             )
-            codec = result.stdout.strip().lower()
-            return codec == "av1" if codec else None
+            data = json.loads(result.stdout)
         except Exception:
             return None
 
+        streams = data.get("streams") or []
+        fmt = data.get("format") or {}
+        video = next((s for s in streams if s.get("codec_type") == "video"), None)
+        if not video:
+            return None
+
+        def _num(value, cast=float):
+            try:
+                return cast(value)
+            except (TypeError, ValueError):
+                return None
+
+        fps = None
+        rate = video.get("avg_frame_rate") or video.get("r_frame_rate") or ""
+        if "/" in rate:
+            num, den = rate.split("/", 1)
+            n, d = _num(num), _num(den)
+            if n and d:
+                fps = round(n / d, 3)
+
+        return {
+            "codec":    (video.get("codec_name") or "").lower() or None,
+            "width":    _num(video.get("width"), int),
+            "height":   _num(video.get("height"), int),
+            "pix_fmt":  video.get("pix_fmt"),
+            "profile":  video.get("profile"),
+            "fps":      fps,
+            "duration": _num(fmt.get("duration")) or _num(video.get("duration")),
+            "bitrate":  _num(fmt.get("bit_rate"), int),
+            "audio": [
+                {"codec": (s.get("codec_name") or "").lower() or None,
+                 "channels": _num(s.get("channels"), int),
+                 "lang": (s.get("tags") or {}).get("language")}
+                for s in streams if s.get("codec_type") == "audio"
+            ],
+            "subs": [
+                (s.get("tags") or {}).get("language") or "und"
+                for s in streams if s.get("codec_type") == "subtitle"
+            ],
+            "source": "ffprobe",
+        }
+
+    def _probe_media_mediainfo(self, p):
+        """Respaldo con MediaInfo cuando ffprobe no está o falla."""
+        try:
+            m = MediaInfo.parse(p)
+        except Exception:
+            return None
+        info = {"codec": None, "width": None, "height": None, "pix_fmt": None,
+                "profile": None, "fps": None, "duration": None, "bitrate": None,
+                "audio": [], "subs": [], "source": "mediainfo"}
+        for t in m.tracks:
+            if t.track_type == "Video" and info["codec"] is None:
+                info["codec"] = (t.format or "").lower() or None
+                info["width"] = int(t.width) if t.width else None
+                info["height"] = int(t.height) if t.height else None
+                if t.duration:
+                    info["duration"] = float(t.duration) / 1000.0
+            elif t.track_type == "Audio":
+                info["audio"].append({"codec": (t.format or "").lower() or None,
+                                      "channels": int(t.channel_s) if t.channel_s else None,
+                                      "lang": t.language})
+            elif t.track_type == "Text":
+                info["subs"].append(t.language or "und")
+        return info if info["codec"] else None
+
+    def probe_media(self, p, save=True):
+        """Sondea el archivo y guarda el resultado en la DB. Siempre va al disco."""
+        ffprobe = self._find_ffprobe()
+        info = self._probe_media_ffprobe(p, ffprobe) if ffprobe else None
+        if info is None:
+            info = self._probe_media_mediainfo(p)
+        if info is None:
+            return None
+        try:
+            st = Path(p).stat()
+            info["probe_size"] = st.st_size
+            info["probe_mtime"] = st.st_mtime
+        except OSError:
+            pass
+        if save:
+            entry = self.vistos_data.setdefault(str(p), {})
+            entry["media"] = info
+            entry["is_av1"] = (info.get("codec") == "av1")
+        return info
+
+    def get_media_info(self, p, refresh=False):
+        """Datos del archivo desde la DB; solo toca el disco si faltan o cambió."""
+        key = str(p)
+        cached = (self.vistos_data.get(key) or {}).get("media")
+        if cached and not refresh:
+            try:
+                st = Path(p).stat()
+                same = (cached.get("probe_size") == st.st_size
+                        and cached.get("probe_mtime") == st.st_mtime)
+            except OSError:
+                same = True   # sin acceso al archivo, confiamos en lo guardado
+            if same:
+                return cached
+        return self.probe_media(p)
+
     def probe_height(self, p):
         """Alto en píxeles del video, o None si no se pudo determinar."""
-        ffprobe = self._find_ffprobe()
-        if ffprobe:
-            try:
-                result = subprocess.run(
-                    [ffprobe, "-v", "quiet", "-select_streams", "v:0",
-                     "-show_entries", "stream=height", "-of", "csv=p=0", str(p)],
-                    capture_output=True, text=True, timeout=15,
-                    encoding="utf-8", errors="replace",
-                    creationflags=subprocess.CREATE_NO_WINDOW
-                )
-                h = result.stdout.strip()
-                if h.isdigit():
-                    return int(h)
-            except Exception:
-                pass
-        try:
-            m = MediaInfo.parse(p)
-            for t in m.tracks:
-                if t.track_type == 'Video' and t.height:
-                    return int(t.height)
-        except Exception:
-            pass
-        return None
+        info = self.get_media_info(p)
+        return (info or {}).get("height")
 
     def check_is_av1(self, p):
-        ffprobe = self._find_ffprobe()
-        if ffprobe:
-            result = self._check_is_av1_ffprobe(p, ffprobe)
-            if result is not None:
-                return result
-        try:
-            m = MediaInfo.parse(p)
-            for t in m.tracks:
-                if t.track_type == 'Video' and 'AV1' in (t.format or '').upper():
-                    return True
+        info = self.get_media_info(p)
+        if info is None:
+            self.log(f"No se pudo analizar {Path(p).name}")
             return False
-        except Exception as e:
-            self.log(f"MediaInfo falló en {Path(p).name}: {e}")
-            return False
+        codec = info.get("codec") or ""
+        return "av1" in codec
 
-    def _detect_subtitle_langs(self, filepath: Path) -> list:
-        """Retorna lista de códigos de idioma para los subtítulos que acompañan al video."""
+    def _detect_subtitle_langs(self, filepath: Path, dir_cache=None) -> list:
+        """Retorna lista de códigos de idioma para los subtítulos que acompañan al video.
+
+        `dir_cache` evita releer la carpeta por cada video: sin él, una carpeta
+        con N videos cuesta N listados del NAS.
+        """
         stem_lower = filepath.stem.lower()
         langs = []
-        try:
-            for f in filepath.parent.iterdir():
-                if f.suffix.lower() not in SUBTITLE_EXTENSIONS:
-                    continue
-                if not f.name.lower().startswith(stem_lower):
-                    continue
-                rest = f.name[len(filepath.stem):]
-                if not rest.startswith('.'):
-                    continue
-                rest_no_ext = rest[:len(rest) - len(f.suffix)].lstrip('.')
-                langs.append(rest_no_ext.lower() if rest_no_ext else "und")
-        except Exception:
-            pass
+        folder = filepath.parent
+        names = None if dir_cache is None else dir_cache.get(folder)
+        if names is None:
+            try:
+                names = [f.name for f in folder.iterdir()
+                         if f.suffix.lower() in SUBTITLE_EXTENSIONS]
+            except Exception:
+                names = []
+            if dir_cache is not None:
+                dir_cache[folder] = names
+        for name in names:
+            if not name.lower().startswith(stem_lower):
+                continue
+            rest = name[len(filepath.stem):]
+            if not rest.startswith('.'):
+                continue
+            suffix = Path(name).suffix
+            rest_no_ext = rest[:len(rest) - len(suffix)].lstrip('.')
+            langs.append(rest_no_ext.lower() if rest_no_ext else "und")
         return langs
 
     def _sub_display(self, path_str: str) -> str:
