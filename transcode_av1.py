@@ -865,6 +865,7 @@ class TranscoderApp(ctk.CTk):
 
     def render_library(self):
         self._render_gen += 1
+        self._out_dir_cache = {}   # se relee la carpeta de salida en cada dibujado
         children = self.tree.get_children()
         if children:
             self.tree.delete(*children)
@@ -897,8 +898,7 @@ class TranscoderApp(ctk.CTk):
             source_text = db_entry.get('identified_by', 'Nombre')
             is_av1 = db_entry.get('is_av1')
             if is_av1 is True:
-                ff = self.get_expected_local_output(item['path'])
-                if ff and ff.exists():
+                if self.find_existing_output(item['path']):
                     status_text = "NO EN ORIGEN (Listo local)"
                     tags = ("no_en_origen",)
                 elif self._exceeds_target(item['path']):
@@ -1341,6 +1341,41 @@ class TranscoderApp(ctk.CTk):
             return None
         return self._output_path(src, out_r, rel)
 
+    def find_existing_output(self, src_str):
+        """Busca el AV1 ya generado para este origen, en la carpeta de salida.
+
+        Además del nombre actual (limpio) reconoce los de esquemas anteriores
+        —con ".AV1" o con la resolución pegada— comparando el nombre sin
+        etiquetas. El listado se cachea por carpeta durante cada render.
+        """
+        ff = self.get_expected_local_output(src_str)
+        if not ff:
+            return None
+        if ff.exists():
+            return ff
+
+        cache = getattr(self, "_out_dir_cache", None)
+        if cache is None:
+            cache = self._out_dir_cache = {}
+        nombres = cache.get(ff.parent)
+        if nombres is None:
+            try:
+                nombres = [f for f in ff.parent.iterdir()
+                           if f.suffix.lower() in SUPPORTED_EXTENSIONS]
+            except OSError:
+                nombres = []
+            cache[ff.parent] = nombres
+        if not nombres:
+            return None
+
+        objetivo = self._normalize_stem(Path(src_str).stem)
+        if not objetivo:
+            return None
+        for f in nombres:
+            if self._normalize_stem(f.stem) == objetivo:
+                return f
+        return None
+
     def move_to_nas_selected(self):
         selected = [s for s in self.tree.selection() if not s.startswith("f:")]
         if not selected: return
@@ -1407,8 +1442,8 @@ class TranscoderApp(ctk.CTk):
 
         for idx, path_str in enumerate(paths, 1):
             src = Path(path_str)
-            ff = self.get_expected_local_output(path_str)
-            if not ff or not ff.exists():
+            ff = self.find_existing_output(path_str)
+            if not ff:
                 self.update_queue.put(("scan_progress", f"[{idx}/{total}] No encontrado local: {src.name}"))
                 continue
 
