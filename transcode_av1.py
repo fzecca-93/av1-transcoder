@@ -47,6 +47,11 @@ CQ_AUTO = {"Anime / Dibujos": 32, "Pelicula / Serie": 30}
 RES_NAME_TAG = re.compile(r"(?i)\b(\d{3,4}p|4k|uhd)\b")
 
 
+# Etiquetas de codec que se limpian del nombre de salida.
+CODEC_NAME_TAG = re.compile(
+    r"(?i)\b(x264|h264|h\.264|x265|h265|h\.265|hevc|avc|av1|xvid|divx|mpeg-?4|vp9|10?bit)\b")
+
+
 def _tag_height(tag: str) -> int:
     """Altura en píxeles que representa una etiqueta del nombre ('720p' -> 720)."""
     t = tag.lower()
@@ -549,6 +554,9 @@ class TranscoderApp(ctk.CTk):
             self.res_info_label.configure(
                 text="Mantiene la resolución del origen", text_color="#888888"
             )
+        # La biblioteca marca lo que supera el objetivo: hay que redibujarla.
+        if hasattr(self, "tree"):
+            self.render_library()
 
     def _on_hw_decode_changed(self):
         """Avisa qué parte del trabajo queda en la GPU."""
@@ -647,6 +655,13 @@ class TranscoderApp(ctk.CTk):
         ctk.CTkLabel(filter_frame, text="MB", font=("Segoe UI", 10)).pack(side="left")
         self.size_filter_entry.bind("<Return>", lambda e: self._apply_size_filter())
         self.size_filter_entry.bind("<FocusOut>", lambda e: self._apply_size_filter())
+
+        # Se combina con el filtro de estado: muestra lo que todavía se puede achicar.
+        self.only_above_target = tk.BooleanVar(value=False)
+        self.above_check = ctk.CTkCheckBox(
+            filter_frame, text="Solo mayores al objetivo", variable=self.only_above_target,
+            command=self.render_library, font=("Segoe UI", 10), checkbox_width=18, checkbox_height=18)
+        self.above_check.pack(side="left", padx=(12, 0))
 
         self.btn_view_toggle = ctk.CTkButton(filter_frame, text="Vista: Lista", width=110,
                                               fg_color="#2c3e50", hover_color="#1a252f",
@@ -791,6 +806,18 @@ class TranscoderApp(ctk.CTk):
             self.btn_f_unknown.configure(fg_color="#95a5a6", border_width=0)
         self.render_library()
 
+    def _height_of(self, path_str) -> int:
+        """Alto guardado en la DB, o 0 si el archivo todavía no fue analizado."""
+        media = (self.vistos_data.get(path_str) or {}).get("media") or {}
+        return media.get("height") or 0
+
+    def _exceeds_target(self, path_str) -> bool:
+        """¿Este archivo está por encima de la resolución de salida elegida?"""
+        dims = RESOLUTIONS.get(self.target_res.get())
+        if not dims:
+            return False
+        return self._height_of(path_str) > dims[1]
+
     def _apply_size_filter(self):
         try:
             self.min_size_mb = float(self.size_filter_entry.get().strip() or 0)
@@ -850,6 +877,14 @@ class TranscoderApp(ctk.CTk):
             else:
                 status_text = "PENDIENTE (Transcodificar)"
                 tags = ("pendiente",)
+
+            # La resolución al lado del estado: un AV1 1080p sigue siendo
+            # reducible, y sin este dato parecía que no quedaba nada por hacer.
+            alto = self._height_of(item['path'])
+            if alto:
+                status_text += f"  ·  {alto}p"
+                if self._exceeds_target(item['path']):
+                    status_text += f" ↓ {self.target_res.get()}"
         code_map = {"av1": "AV1", "no_en_origen": "LISTO_LOCAL", "omitido": "OMITIDO",
                     "nuevo": "NUEVO", "pendiente": "PENDIENTE", "desconocido": "DESCONOCIDO"}
         return status_text, source_text, tags, code_map.get(tags[0], "TODOS")
@@ -873,6 +908,8 @@ class TranscoderApp(ctk.CTk):
                 continue
             db_entry = self.vistos_data.get(item['path'], {})
             if self.min_size_mb > 0 and (db_entry.get('size', 0) or 0) < self.min_size_mb * 1024 * 1024:
+                continue
+            if self.only_above_target.get() and not self._exceeds_target(item['path']):
                 continue
             sz = _format_size(db_entry.get('size', 0))
             sub_text = self._sub_display(item['path'])
@@ -1171,30 +1208,31 @@ class TranscoderApp(ctk.CTk):
             pass
 
     def _build_output_name(self, src: Path) -> str:
-        """Nombre del archivo de salida: la etiqueta de codec pasa a AV1 y, si se
-        pidió downscale, la etiqueta de resolución pasa a la elegida (o se añade
-        al final si el nombre no traía ninguna)."""
-        codec_tag = r"(?i)x264|h264|h\.264|x265|h265|h\.265|hevc|avc"
-        ns = re.sub(codec_tag, "AV1", src.stem)
-        if ns == src.stem and not re.search(r"(?i)\bAV1\b", ns):
-            # Sin etiqueta de codec reconocible: la añadimos (salvo que ya diga AV1,
-            # como pasa al rebajar de resolución un archivo ya convertido).
-            ns = src.stem + ".AV1"
-        res = self.target_res.get()
-        dims = RESOLUTIONS.get(res)
-        if dims:
-            tags = RES_NAME_TAG.findall(ns)
-            if not tags:
-                # El nombre no dice la resolución: marcamos la salida para no
-                # pisar una copia previa hecha en "Original".
-                ns += f".{res}"
-            elif dims[1] < max(_tag_height(t) for t in tags):
-                # Solo renombramos si hubo downscale real; HandBrake nunca
-                # amplía, así que un 720p en modo 1080p conserva su nombre.
-                ns = RES_NAME_TAG.sub(res, ns)
-                # "4K.UHD" produce la etiqueta repetida: la colapsamos.
-                ns = re.sub(rf"(?:{res}[.\s_-]+)+{res}", res, ns)
+        """Nombre de salida limpio: el original sin etiquetas de codec ni de
+        resolución. Esos datos ya se leen del archivo y viven en la DB, así que
+        en el nombre solo estorban y envejecen mal."""
+        MARCA = "\x00"
+        ns = CODEC_NAME_TAG.sub(MARCA, src.stem)
+        ns = RES_NAME_TAG.sub(MARCA, ns)
+        # Cada etiqueta se lleva el separador que la precede (o el que la sigue,
+        # si estaba al principio), para no dejar ".." ni " - " colgando.
+        ns = re.sub(rf"[ ._-]?{MARCA}", "", ns)
+        ns = re.sub(rf"{MARCA}[ ._-]?", "", ns)
+        ns = ns.strip(" ._-")
+        if not ns:
+            ns = src.stem   # el nombre era solo etiquetas: mejor dejarlo como estaba
         return ns + ".mkv"
+
+    def _output_path(self, src: Path, out_r: Path, rel: Path) -> Path:
+        """Ruta de salida, garantizando que jamás apunte al archivo de origen.
+
+        Como el nombre ya no lleva ".AV1", un original sin etiquetas podría
+        generar exactamente su misma ruta si origen y destino coinciden.
+        """
+        ff = out_r / rel / self._build_output_name(src)
+        if os.path.normcase(str(ff)) == os.path.normcase(str(src)):
+            ff = ff.with_name(f"{ff.stem}.AV1{ff.suffix}")
+        return ff
 
     def _skip_because_already_av1(self, src: Path) -> bool:
         """Un AV1 se saltea salvo que se haya pedido bajarlo de resolución y el
@@ -1253,8 +1291,7 @@ class TranscoderApp(ctk.CTk):
             rel = src.parent.relative_to(in_r)
         except ValueError:
             return None
-        ff = out_r / rel / self._build_output_name(src)
-        return ff
+        return self._output_path(src, out_r, rel)
 
     def move_to_nas_selected(self):
         selected = [s for s in self.tree.selection() if not s.startswith("f:")]
@@ -1330,8 +1367,14 @@ class TranscoderApp(ctk.CTk):
             new_nas_path = src.parent / ff.name
             self.update_queue.put(("log", f"[NAS {idx}/{total}] Iniciando: {ff.name}\n"))
 
+            # Con nombres de salida limpios, el AV1 puede llamarse igual que el
+            # original: en ese caso la copia YA lo reemplazó y borrarlo destruiría
+            # el archivo recién subido.
+            reemplaza_al_original = (os.path.normcase(str(new_nas_path))
+                                     == os.path.normcase(str(src)))
+
             if self._move_to_nas_with_progress(ff, new_nas_path, idx, total):
-                if src.exists():
+                if src.exists() and not reemplaza_al_original:
                     try:
                         src.unlink()
                     except Exception as e:
@@ -1757,8 +1800,8 @@ class TranscoderApp(ctk.CTk):
                 result['skip'] = True
                 return
 
-            of = self._build_output_name(src)
-            ff = out_r / src.parent.relative_to(in_r) / of
+            ff = self._output_path(src, out_r, src.parent.relative_to(in_r))
+            of = ff.name
 
             if ff.exists():
                 self._update_db_entry(src, is_av1=True, identified_by="Salida ya existe")
@@ -1803,8 +1846,8 @@ class TranscoderApp(ctk.CTk):
             self._update_db_entry(src, is_av1=True, identified_by="Verificación directa")
             return
 
-        of = self._build_output_name(src)
-        ff = out_r / src.parent.relative_to(in_r) / of
+        ff = self._output_path(src, out_r, src.parent.relative_to(in_r))
+        of = ff.name
         if ff.exists():
             self._update_db_entry(src, is_av1=True, identified_by="Salida ya existe")
             return
