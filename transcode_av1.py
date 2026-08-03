@@ -2730,6 +2730,13 @@ class TranscoderApp(ctk.CTk):
             # por espacio en disco: cada uno ocupa lo que pese el original.
             MAX_PREFETCH_AHEAD = 2
 
+            # Resumen inicial: sin esto no hay forma de saber si la cola trae
+            # material ya descargado o si va a depender de la red todo el tiempo.
+            ya = sum(1 for p in self.transcode_queue if self._local_copy_of(Path(p)))
+            self.update_queue.put(("log",
+                f"[Cola] {len(self.transcode_queue)} archivo(s): {ya} ya descargado(s), "
+                f"{len(self.transcode_queue) - ya} por bajar del NAS.\n"))
+
             def _proximo_a_bajar():
                 """Primer archivo de la cola que todavía haya que traer del NAS.
 
