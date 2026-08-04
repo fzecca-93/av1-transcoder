@@ -53,6 +53,13 @@ FILTER_SETS = {
     "DESCONOCIDO": {"DESCONOCIDO"},
 }
 
+# Descarga anticipada: cuántas bajadas simultáneas (más no acelera, satura la red),
+# cuántas pueden quedar esperando turno en modo normal, y cuánto espacio libre hay
+# que respetar cuando se adelanta toda la cola.
+DESCARGAS_EN_PARALELO = 2
+MAX_PREFETCH_AHEAD = 2
+MARGEN_DISCO_GB = 20
+
 CQ_CHOICES = ["Auto"] + [str(q) for q in range(22, 39, 2)]
 CQ_AUTO = {"Anime / Dibujos": 32, "Pelicula / Serie": 30}
 # Etiqueta de resolución dentro del nombre del archivo (para renombrar la salida).
@@ -102,6 +109,7 @@ class TranscoderApp(ctk.CTk):
         self.target_res    = tk.StringVar(value="Original") # Original | 1080p | 720p
         self.target_cq     = tk.StringVar(value="Auto")     # Auto | "22".."38"
         self.hw_decode     = tk.BooleanVar(value=False)     # decodificar con NVDEC
+        self.descarga_continua = tk.BooleanVar(value=False) # llenar el disco por adelantado
 
         # Multi-library state
         self.libraries = []   # [{name, input_dir, output_dir}, ...]
@@ -526,6 +534,21 @@ class TranscoderApp(ctk.CTk):
         self.hw_info_label.grid(row=4, column=2, padx=(0, 15), pady=(0, 10), sticky="e")
         self._on_hw_decode_changed()
 
+        # ── Fila 5: descarga anticipada ─────────────────────────────────────
+        ctk.CTkLabel(mode_frame, text="Descarga:", font=("Segoe UI", 12, "bold")).grid(
+            row=5, column=0, padx=(15, 10), pady=(0, 10), sticky="w")
+        self.descarga_check = ctk.CTkCheckBox(
+            mode_frame,
+            text="Adelantar toda la cola  ·  deja archivos listos para usar sin el NAS",
+            variable=self.descarga_continua,
+            command=self._on_descarga_changed,
+            font=("Segoe UI", 11),
+        )
+        self.descarga_check.grid(row=5, column=1, padx=10, pady=(0, 10), sticky="w")
+        self.descarga_info_label = ctk.CTkLabel(mode_frame, text="", font=("Segoe UI", 11))
+        self.descarga_info_label.grid(row=5, column=2, padx=(0, 15), pady=(0, 10), sticky="e")
+        self._on_descarga_changed()
+
         self.log_text = ctk.CTkTextbox(self.tab_transcode, font=("Consolas", 11), fg_color="#121212")
         self.log_text.grid(row=4, column=0, padx=10, pady=5, sticky="nsew")
         self.start_button = ctk.CTkButton(self.tab_transcode, text="INICIAR TRANSCODIFICACIÓN", height=45, command=self.toggle_processing)
@@ -584,6 +607,28 @@ class TranscoderApp(ctk.CTk):
             self.hw_info_label.configure(
                 text="Máxima velocidad (recomendado)", text_color="#888888"
             )
+
+    def _on_descarga_changed(self):
+        """Muestra hasta dónde va a descargar por adelantado.
+
+        Si se activa con la cola ya andando, se despiertan las descargas en el
+        momento: si no, habría que esperar al próximo archivo para que el
+        pipeline volviera a evaluar cuánto puede bajar.
+        """
+        pedir_mas = getattr(self, "_pedir_mas_descargas", None)
+        if pedir_mas and self.is_processing and self.descarga_continua.get():
+            threading.Thread(target=pedir_mas, daemon=True).start()
+
+        if self.descarga_continua.get():
+            try:
+                libre = shutil.disk_usage(self.output_dir.get() or ".").free / 1024**3
+                detalle = f"hasta dejar {MARGEN_DISCO_GB} GB libres ({libre:.0f} GB ahora)"
+            except OSError:
+                detalle = f"hasta dejar {MARGEN_DISCO_GB} GB libres"
+            self.descarga_info_label.configure(text=detalle, text_color="#e67e22")
+        else:
+            self.descarga_info_label.configure(
+                text=f"solo {MAX_PREFETCH_AHEAD} por adelantado", text_color="#888888")
 
     def _on_cq_changed(self, value):
         """Muestra el CQ que se va a usar realmente."""
@@ -1973,7 +2018,11 @@ class TranscoderApp(ctk.CTk):
                 elif task == "finished":
                     self.is_processing = False
                     self.eta_label.configure(text="Restante: —")
-                    self.start_button.configure(text="INICIAR TRANSCODIFICACIÓN")
+                    self.start_button.configure(text="INICIAR TRANSCODIFICACIÓN",
+                                                fg_color=("#3b8ed0", "#1f6aa5"),
+                                                hover_color=("#36719f", "#144870"))
+                    self.queue_btn.configure(state="normal")
+                    self._update_queue_button()
                     # Sin esto la pantalla queda con el último estado ("Moviendo
                     # resultado al destino...") y parece que sigue trabajando.
                     pendientes = len(self.transcode_queue)
@@ -2713,6 +2762,9 @@ class TranscoderApp(ctk.CTk):
             messagebox.showwarning("Atención", "Configurá la carpeta destino en la pestaña Transcodificador.")
             return
         self.is_processing = True
+        # El botón grande queda como freno: si no, arrancando desde la cola
+        # seguía diciendo "INICIAR" y no había forma visible de detener.
+        self.start_button.configure(text="■  DETENER", fg_color="#c0392b", hover_color="#a93226")
         self.queue_btn.configure(state="disabled", text=f"Procesando... ({len(self.transcode_queue)} restantes)")
         threading.Thread(target=self.transcoding_engine_from_queue, daemon=True).start()
 
@@ -2726,9 +2778,32 @@ class TranscoderApp(ctk.CTk):
             (temp_dir / "Output").mkdir(parents=True, exist_ok=True)
 
             # ── Pipeline de pre-carga continua ───────────────────────────────
-            # Cuántos archivos bajados pueden esperar su turno. El límite existe
-            # por espacio en disco: cada uno ocupa lo que pese el original.
-            MAX_PREFETCH_AHEAD = 2
+            def _hay_lugar_para_otra_descarga():
+                """¿Conviene lanzar una descarga más?
+
+                Se separan dos cosas que antes iban juntas: cuántas bajan a la
+                vez (fijo, para no saturar la red) y cuántas pueden quedar
+                esperando turno. En modo continuo lo segundo lo limita el disco,
+                no un número, para que al desconectarse haya material acumulado.
+                """
+                current = self.transcode_queue[0] if self.transcode_queue else None
+                with prefetch_lock:
+                    activas = sum(1 for t in prefetch_threads.values() if t.is_alive())
+                    esperando = sum(1 for k in prefetch_cache if k != current)
+                if activas >= DESCARGAS_EN_PARALELO:
+                    return False
+                if not self.descarga_continua.get():
+                    return esperando < MAX_PREFETCH_AHEAD
+                try:
+                    libre = shutil.disk_usage(str(temp_dir)).free
+                except OSError:
+                    return esperando < MAX_PREFETCH_AHEAD
+                if libre <= MARGEN_DISCO_GB * 1024**3:
+                    self.update_queue.put(("log",
+                        f"  [Pipeline] Descarga pausada: quedan {libre/1024**3:.1f} GB "
+                        f"libres (mínimo {MARGEN_DISCO_GB} GB).\n"))
+                    return False
+                return True
 
             # Resumen inicial: sin esto no hay forma de saber si la cola trae
             # material ya descargado o si va a depender de la red todo el tiempo.
@@ -2772,14 +2847,7 @@ class TranscoderApp(ctk.CTk):
 
                 def _on_done():
                     """Al terminar esta descarga, encadenar la siguiente si hay lugar."""
-                    current = self.transcode_queue[0] if self.transcode_queue else None
-                    with prefetch_lock:
-                        buffered = sum(1 for k in prefetch_cache if k != current)
-                    if buffered >= MAX_PREFETCH_AHEAD:
-                        return
-                    siguiente = _proximo_a_bajar()
-                    if siguiente:
-                        _launch_prefetch_for(siguiente)
+                    _rellenar_descargas()
 
                 def _worker():
                     self._prefetch_verify_and_copy(src_p, input_root, output_root, temp_dir, result)
@@ -2791,6 +2859,18 @@ class TranscoderApp(ctk.CTk):
                 t.start()
                 self.update_queue.put(("log",
                     f"  [Pipeline] Iniciando pre-carga: {src_p.name}\n"))
+
+            def _rellenar_descargas():
+                """Lanza descargas hasta llenar el cupo disponible."""
+                while _hay_lugar_para_otra_descarga():
+                    siguiente = _proximo_a_bajar()
+                    if not siguiente:
+                        return
+                    _launch_prefetch_for(siguiente)
+
+            # Queda accesible para que tildar "Adelantar toda la cola" a mitad
+            # de una tanda despierte las descargas sin esperar al próximo archivo.
+            self._pedir_mas_descargas = _rellenar_descargas
 
             while self.transcode_queue and self.is_processing:
                 # Primero lo que ya está en disco, así la GPU nunca espera a la
@@ -2837,23 +2917,11 @@ class TranscoderApp(ctk.CTk):
                 # Se lanzan varias de una, no una sola: si la cola empieza con
                 # muchos locales, las descargas de los remotos arrancan ya y para
                 # cuando les toque el turno están listas.
-                def start_next_prefetch():
-                    for _ in range(MAX_PREFETCH_AHEAD):
-                        current = self.transcode_queue[0] if self.transcode_queue else None
-                        with prefetch_lock:
-                            buffered = sum(1 for k in prefetch_cache if k != current)
-                        if buffered >= MAX_PREFETCH_AHEAD:
-                            return
-                        siguiente = _proximo_a_bajar()
-                        if not siguiente:
-                            return
-                        _launch_prefetch_for(siguiente)
-
                 duracion_src = ((self.vistos_data.get(path_str) or {}).get("media") or {}).get("duration")
                 t_inicio = time.time()
                 try:
                     self.process_single_file(src, input_root, output_root, temp_dir,
-                                             on_transcode_start=start_next_prefetch,
+                                             on_transcode_start=_rellenar_descargas,
                                              prefetch_data=cached)
                 except Exception as e:
                     self.update_queue.put(("log", f"Error procesando {src.name}: {e}\n"))
@@ -2869,6 +2937,7 @@ class TranscoderApp(ctk.CTk):
             self.update_queue.put(("finished", None))
             self.update_queue.put(("queue_updated", len(self.transcode_queue)))
         finally:
+            self._pedir_mas_descargas = None
             self.allow_sleep()
 
     def start_cleanup(self):
