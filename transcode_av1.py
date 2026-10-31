@@ -119,6 +119,9 @@ class TranscoderApp(ctk.CTk):
         self.is_processing = False
         self.is_scanning = False
         self.transcode_queue = []   # list of file path strings pending transcoding
+        # Archivos que el usuario mandó a la cola a pesar del aviso (ya AV1 o
+        # marcados NO TRANSCODIFICAR): el motor no los puede saltear.
+        self.forced_paths = set()
 
         self.total_savings_mb = 0.0
         self.files_processed = 0
@@ -129,6 +132,8 @@ class TranscoderApp(ctk.CTk):
         self.current_filter = "TODOS"
         self.min_size_mb = 0.0
         self.view_mode = "flat"
+        self.sort_key = "nombre"    # "nombre" | "size"
+        self.sort_desc = False
         self._render_gen = 0
 
         self.update_queue = queue.Queue()
@@ -750,10 +755,11 @@ class TranscoderApp(ctk.CTk):
 
         columns = ("nombre", "size", "estado", "origen", "subs")
         self.tree = ttk.Treeview(self.tree_frame, columns=columns, show='headings', selectmode="extended")
-        self.tree.heading("#0", text="CARPETA / ARCHIVO", anchor="w")
+        self.tree.heading("#0", text="CARPETA / ARCHIVO", anchor="w",
+                          command=lambda: self.set_sort("nombre"))
         self.tree.column("#0", width=380, anchor="w", minwidth=150)
-        self.tree.heading("nombre", text="ARCHIVO")
-        self.tree.heading("size", text="TAMAÑO")
+        self.tree.heading("nombre", text="ARCHIVO", command=lambda: self.set_sort("nombre"))
+        self.tree.heading("size", text="TAMAÑO", command=lambda: self.set_sort("size"))
         self.tree.heading("estado", text="ESTADO / CODEC")
         self.tree.heading("origen", text="SOPORTE")
         self.tree.heading("subs", text="SUBTÍTULOS")
@@ -782,6 +788,7 @@ class TranscoderApp(ctk.CTk):
         self.tree.bind("<Button-3>", self.show_context_menu)
 
         # Initial render from DB
+        self._update_sort_headings()
         self.render_library()
         self._update_lib_count()
 
@@ -946,6 +953,37 @@ class TranscoderApp(ctk.CTk):
         else:
             self._render_flat_mode()
 
+    # ── Orden de la biblioteca ──────────────────────────────────────────────
+
+    def _file_size(self, path):
+        return self.vistos_data.get(path, {}).get('size', 0) or 0
+
+    def _sort_lib_files(self, lib_files):
+        """Ordena por nombre o por tamaño según la columna elegida."""
+        if self.sort_key == "size":
+            key = lambda it: (self._file_size(it['path']), it['name'].lower())
+        else:
+            key = lambda it: it['name'].lower()
+        return sorted(lib_files, key=key, reverse=self.sort_desc)
+
+    def set_sort(self, key):
+        """Click en el encabezado: cambia de columna o invierte el sentido."""
+        if self.sort_key == key:
+            self.sort_desc = not self.sort_desc
+        else:
+            self.sort_key = key
+            self.sort_desc = (key == "size")   # el tamaño arranca de mayor a menor
+        self._update_sort_headings()
+        self.render_library()
+
+    def _update_sort_headings(self):
+        arrow = " ▼" if self.sort_desc else " ▲"
+        by_name = arrow if self.sort_key == "nombre" else ""
+        by_size = arrow if self.sort_key == "size" else ""
+        self.tree.heading("#0", text=f"CARPETA / ARCHIVO{by_name}")
+        self.tree.heading("nombre", text=f"ARCHIVO{by_name}")
+        self.tree.heading("size", text=f"TAMAÑO{by_size}")
+
     def toggle_view_mode(self):
         self.view_mode = "tree" if self.view_mode == "flat" else "flat"
         self.btn_view_toggle.configure(text="Vista: Árbol" if self.view_mode == "tree" else "Vista: Lista")
@@ -1009,7 +1047,7 @@ class TranscoderApp(ctk.CTk):
 
     def _render_flat_mode(self):
         self.tree.configure(show='headings', displaycolumns=("nombre", "size", "estado", "origen", "subs"))
-        lib_files = self._get_lib_files()
+        lib_files = self._sort_lib_files(self._get_lib_files())
         gen = self._render_gen
         if not lib_files:
             self.tree.insert('', 'end', values=(
@@ -1060,7 +1098,7 @@ class TranscoderApp(ctk.CTk):
     def _render_tree_mode(self):
         self.tree.configure(show='tree headings', displaycolumns=("size", "estado", "origen", "subs"))
         self.tree.column("#0", width=380, anchor="w", minwidth=150)
-        lib_files = self._get_lib_files()
+        lib_files = self._sort_lib_files(self._get_lib_files())
         prefix = self.input_dir.get().strip()
         if not lib_files or not prefix:
             self._render_flat_mode()
@@ -1124,7 +1162,21 @@ class TranscoderApp(ctk.CTk):
                 all_folders.add(str(p))
                 p = p.parent
 
-        sorted_folders = sorted(all_folders, key=lambda x: (len(Path(x).parts), x))
+        # Los padres van siempre antes que los hijos; dentro de cada nivel manda
+        # la columna elegida, así los hermanos quedan en ese orden.
+        if self.sort_key == "size":
+            sizes = {f: recursive_stats(f)[4] for f in all_folders}
+            def folder_order(x):
+                sz = sizes[x]
+                return (len(Path(x).parts), -sz if self.sort_desc else sz, x.lower())
+        else:
+            def folder_order(x):
+                return (len(Path(x).parts), x.lower())
+        sorted_folders = sorted(all_folders, key=folder_order,
+                                reverse=self.sort_desc and self.sort_key == "nombre")
+        if self.sort_desc and self.sort_key == "nombre":
+            # El reverse también invirtió la profundidad: los padres primero otra vez.
+            sorted_folders.sort(key=lambda x: len(Path(x).parts))
         inserted = set()
 
         def insert_folder(rel_str):
@@ -2159,20 +2211,26 @@ class TranscoderApp(ctk.CTk):
         except Exception:
             pass
 
-    def _prefetch_verify_and_copy(self, src: Path, in_r: Path, out_r: Path, tmp: Path, result: dict):
+    def _prefetch_verify_and_copy(self, src: Path, in_r: Path, out_r: Path, tmp: Path,
+                                  result: dict, forzar: bool = False):
         """Hilo de fondo: verifica codec y copia NAS→local el siguiente archivo de la cola."""
         try:
-            if self._skip_because_already_av1(src):
+            if not forzar and self._skip_because_already_av1(src):
                 self._update_db_entry(src, is_av1=True, identified_by="Verificación directa")
                 result['skip'] = True
+                self.update_queue.put(("log",
+                    f"SALTEADO {src.name}: ya es AV1 dentro del objetivo "
+                    f"({self.target_res.get()}); no se descarga.\n"))
                 return
 
             ff = self._output_path(src, out_r, src.parent.relative_to(in_r))
             of = ff.name
 
-            if ff.exists():
+            if ff.exists() and not forzar:
                 self._update_db_entry(src, is_av1=True, identified_by="Salida ya existe")
                 result['skip'] = True
+                self.update_queue.put(("log",
+                    f"SALTEADO {src.name}: ya existe la salida en {ff}; no se descarga.\n"))
                 return
 
             li = tmp / "Input" / src.name
@@ -2215,11 +2273,21 @@ class TranscoderApp(ctk.CTk):
             self.update_queue.put(("log", f"  [Pipeline] Error prefetch {src.name}: {e}\n"))
 
     def process_single_file(self, src: Path, in_r: Path, out_r: Path, tmp: Path,
-                            on_transcode_start=None, prefetch_data=None):
+                            on_transcode_start=None, prefetch_data=None, forzar=False):
         self.update_queue.put(("status", {"file": src.name, "action": "Verificando codec..."}))
 
-        if self._skip_because_already_av1(src):
+        if forzar:
+            # Lo mandó el usuario aceptando el aviso de la biblioteca: si acá se
+            # saltea igual, esa confirmación no sirve para nada.
+            self.update_queue.put(("log",
+                f"FORZADO {src.name}: se transcodifica aunque ya figure como hecho.\n"))
+
+        if not forzar and self._skip_because_already_av1(src):
             self._update_db_entry(src, is_av1=True, identified_by="Verificación directa")
+            # Sin este aviso la cola terminaba sin copiar nada y sin decir por qué.
+            self.update_queue.put(("log",
+                f"SALTEADO {src.name}: ya es AV1 dentro del objetivo "
+                f"({self.target_res.get()}), no hay nada que transcodificar.\n"))
             return
 
         # Ficha del origen (ya cacheada por la verificación de codec), para poder
@@ -2228,9 +2296,14 @@ class TranscoderApp(ctk.CTk):
 
         ff = self._output_path(src, out_r, src.parent.relative_to(in_r))
         of = ff.name
-        if ff.exists():
+        if ff.exists() and not forzar:
             self._update_db_entry(src, is_av1=True, identified_by="Salida ya existe")
+            self.update_queue.put(("log",
+                f"SALTEADO {src.name}: ya existe la salida en {ff}\n"))
             return
+        if ff.exists():
+            self.update_queue.put(("log",
+                f"  [Destino] Al terminar se reemplaza la salida ya existente: {ff}\n"))
         ff.parent.mkdir(parents=True, exist_ok=True)
         li, lo = tmp / "Input" / src.name, tmp / "Output" / of
 
@@ -2246,6 +2319,14 @@ class TranscoderApp(ctk.CTk):
             self.update_queue.put(("progress", 100))
             self.update_queue.put(("log", f"  [Local] Usando la copia descargada de {src.name}\n"))
         else:
+            # La copia sólo se veía en la barra de estado: en el log la tanda
+            # parecía no hacer nada hasta que terminaba.
+            try:
+                mb = src.stat().st_size / 1024 / 1024
+                detalle = f" ({mb:,.0f} MB)"
+            except OSError:
+                detalle = ""
+            self.update_queue.put(("log", f"  [NAS] Descargando {src.name}{detalle}...\n"))
             self.update_queue.put(("status", {"file": src.name, "action": "Copiando desde NAS..."}))
             self.update_queue.put(("progress", 0))
             if not self._copy_with_progress(src, li):
@@ -2427,6 +2508,14 @@ class TranscoderApp(ctk.CTk):
                     # Se lee el resultado ANTES de moverlo: está en disco local,
                     # así que sale barato y da la resolución real, no la supuesta.
                     salida = self.probe_media(lo, save=False) or {}
+                    if forzar and ff.exists():
+                        # shutil.move no sobreescribe en Windows: hay que sacar
+                        # la salida anterior o se pierde el recién codificado.
+                        try:
+                            ff.unlink()
+                        except OSError as del_err:
+                            self.update_queue.put(("log",
+                                f"  [Destino] No se pudo borrar la salida anterior: {del_err}\n"))
                     if self.safe_io(shutil.move, lo, ff):
                         procesado_ok = True
                         self.update_queue.put(("stats", {"savings": s}))
@@ -2541,6 +2630,7 @@ class TranscoderApp(ctk.CTk):
                 "Archivos ya optimizados (AV1)",
                 "OPTIMIZADO (AV1)",
             ):
+                self.forced_paths.add(path_str)
                 if path_str not in self.transcode_queue:
                     self.transcode_queue.append(path_str)
                     added += 1
@@ -2552,6 +2642,7 @@ class TranscoderApp(ctk.CTk):
                 "Archivos marcados como NO TRANSCODIFICAR",
                 "NO TRANSCODIFICAR\n(poco ahorro o marcado manual)",
             ):
+                self.forced_paths.add(path_str)
                 if path_str not in self.transcode_queue:
                     self.transcode_queue.append(path_str)
                     added += 1
@@ -2660,6 +2751,7 @@ class TranscoderApp(ctk.CTk):
             if not indices:
                 return
             for idx in indices:
+                self.forced_paths.discard(self.transcode_queue[idx])
                 self.transcode_queue.pop(idx)
             _refresh()
 
@@ -2668,6 +2760,7 @@ class TranscoderApp(ctk.CTk):
                 return
             if messagebox.askyesno("Confirmar", "¿Limpiar toda la cola?", parent=win):
                 self.transcode_queue.clear()
+                self.forced_paths.clear()
                 _refresh()
 
         def _move_up():
@@ -2823,7 +2916,7 @@ class TranscoderApp(ctk.CTk):
                     if i == 0:
                         continue   # el que se está codificando ahora
                     with prefetch_lock:
-                        if p in prefetch_cache:
+                        if p in prefetch_cache or p in no_descargables:
                             continue
                     if self._local_copy_of(Path(p)):
                         continue   # ya está: no hay nada que descargar
@@ -2832,16 +2925,26 @@ class TranscoderApp(ctk.CTk):
 
             prefetch_cache   = {}   # path_str → result dict (listo o en progreso)
             prefetch_threads = {}   # path_str → Thread
+            no_descargables  = set()  # orígenes que no se pueden bajar (no existen)
             prefetch_lock    = threading.Lock()
 
             def _launch_prefetch_for(path_str):
-                """Inicia la pre-carga de path_str si aún no está en caché."""
+                """Inicia la pre-carga de path_str si aún no está en caché.
+
+                Devuelve True sólo si quedó una descarga andando. El aviso importa:
+                si se sale sin registrar nada y el que llama vuelve a preguntar por
+                el próximo, sale otra vez el mismo archivo y el bucle no termina más.
+                """
                 with prefetch_lock:
                     if path_str in prefetch_cache or not self.is_processing:
-                        return
+                        return False
                     src_p = Path(path_str)
                     if not src_p.exists():
-                        return
+                        # Sin origen no hay nada que traer. Se anota para no volver
+                        # a elegirlo; el bucle principal ya avisa y lo saltea cuando
+                        # le toque el turno.
+                        no_descargables.add(path_str)
+                        return False
                     result = {}
                     prefetch_cache[path_str] = result
 
@@ -2850,7 +2953,8 @@ class TranscoderApp(ctk.CTk):
                     _rellenar_descargas()
 
                 def _worker():
-                    self._prefetch_verify_and_copy(src_p, input_root, output_root, temp_dir, result)
+                    self._prefetch_verify_and_copy(src_p, input_root, output_root, temp_dir,
+                                                   result, forzar=path_str in self.forced_paths)
                     _on_done()
 
                 t = threading.Thread(target=_worker, daemon=True)
@@ -2859,14 +2963,16 @@ class TranscoderApp(ctk.CTk):
                 t.start()
                 self.update_queue.put(("log",
                     f"  [Pipeline] Iniciando pre-carga: {src_p.name}\n"))
+                return True
 
             def _rellenar_descargas():
                 """Lanza descargas hasta llenar el cupo disponible."""
-                while _hay_lugar_para_otra_descarga():
+                while self.is_processing and _hay_lugar_para_otra_descarga():
                     siguiente = _proximo_a_bajar()
                     if not siguiente:
                         return
-                    _launch_prefetch_for(siguiente)
+                    if not _launch_prefetch_for(siguiente):
+                        return   # no se pudo arrancar: cortar en vez de reintentar
 
             # Queda accesible para que tildar "Adelantar toda la cola" a mitad
             # de una tanda despierte las descargas sin esperar al próximo archivo.
@@ -2922,13 +3028,15 @@ class TranscoderApp(ctk.CTk):
                 try:
                     self.process_single_file(src, input_root, output_root, temp_dir,
                                              on_transcode_start=_rellenar_descargas,
-                                             prefetch_data=cached)
+                                             prefetch_data=cached,
+                                             forzar=path_str in self.forced_paths)
                 except Exception as e:
                     self.update_queue.put(("log", f"Error procesando {src.name}: {e}\n"))
                 self._registrar_tiempo(duracion_src, time.time() - t_inicio)
 
                 if self.transcode_queue and self.transcode_queue[0] == path_str:
                     self.transcode_queue.pop(0)
+                self.forced_paths.discard(path_str)
                 with prefetch_lock:
                     prefetch_cache.pop(path_str, None)
                     prefetch_threads.pop(path_str, None)
